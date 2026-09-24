@@ -132,7 +132,7 @@ export const useRetirementStore = defineStore('retirement', () => {
     const nowIso = new Date().toISOString()
     let result = { status: 'error' }
 
-    await db.transaction('rw', db.docs, db.retirements, db.reviews, db.handovers, async () => {
+    await db.transaction('rw', db.docs, db.retirements, db.reviews, db.changeGates, db.handovers, async () => {
       const doc = await db.docs.get(docId)
       if (!doc) { result = { status: 'missing' }; return }
       if (doc.ownerId !== userId && role !== ROLE.ADMIN) { result = { status: 'denied', title: doc.title }; return }
@@ -161,6 +161,12 @@ export const useRetirementStore = defineStore('retirement', () => {
         .where('docId').equals(docId)
         .filter((rv) => rv.status === 'pending').first()
       if (pendingReview) { result = { status: 'in-review', title: doc.title }; return }
+
+      // 发布门禁流转中的文档先走完门禁（放行/回退）再退役，避免待发布版本与挂起链接状态交错
+      const activeGate = await db.changeGates
+        .where('docId').equals(docId)
+        .filter((g) => g.status === 'pending_impact' || g.status === 'pending_approval').first()
+      if (activeGate) { result = { status: 'in-gate', title: doc.title }; return }
 
       // 交接中的文档先完成/取消交接，避免所有权与退役责任交错（按篇判定：该篇仍在流转才占用）
       const handover = await db.handovers.filter((h) => (h.items || []).some((i) => i.docId === docId && isItemOpen(i))).first()
@@ -234,6 +240,7 @@ export const useRetirementStore = defineStore('retirement', () => {
     const openRepCache = new Map()
     const activeRepCache = new Map()
     const reviewCache = new Map()
+    const gateCache = new Map()
     const handoverCache = new Map()
     const openRetirementOfDocTx = (id) => {
       if (!openCache.has(id)) openCache.set(id, allRetirements.find((r) => isRetirementOpen(r) && r.docId === id) || null)
@@ -253,11 +260,13 @@ export const useRetirementStore = defineStore('retirement', () => {
     }
     const allOldIds = [...new Set(cleanRows.map((x) => x.docId))]
     await Promise.all(allOldIds.map(async (id) => {
-      const [rv, ho] = await Promise.all([
+      const [rv, gt, ho] = await Promise.all([
         db.reviews.where('docId').equals(id).filter((x) => x.status === 'pending').first(),
+        db.changeGates.where('docId').equals(id).filter((x) => x.status === 'pending_impact' || x.status === 'pending_approval').first(),
         db.handovers.filter((h) => (h.items || []).some((i) => i.docId === id && isItemOpen(i))).first()
       ])
       reviewCache.set(id, rv || null)
+      gateCache.set(id, gt || null)
       handoverCache.set(id, ho || null)
     }))
     const checked = checkRetirementBatch(cleanRows, {
@@ -267,12 +276,15 @@ export const useRetirementStore = defineStore('retirement', () => {
       activeRetirementOfDoc: activeRetirementOfDocTx,
       openUsingAsReplacement, activeUsingAsReplacement,
       pendingReviewOfDoc: (id) => reviewCache.get(id) || null,
+      openGateOfDoc: (id) => gateCache.get(id) || null,
       openHandoverOfDoc: (id) => handoverCache.get(id) || null
     })
     // 归属复核（checkRetirementBatch 的 ctx 未带权限信息，统一在此判定）
+    // 发布门禁流转中的文档逐篇拦截（checkRetirementBatch 之外的新增占用）
     for (const row of checked.rows) {
       const doc = docs[row.docId]
       if (doc && doc.ownerId !== userId && role !== ROLE.ADMIN) row.error = 'denied'
+      if (!row.error && gateCache.get(row.docId)) row.error = 'in-gate'
     }
     return { rows: checked.rows, docs }
   }
@@ -300,7 +312,7 @@ export const useRetirementStore = defineStore('retirement', () => {
     // 预检事务：以库中最新数据逐行判定
     const { rows: checkedRows } = await db.transaction(
       'r',
-      db.docs, db.retirements, db.reviews, db.handovers,
+      db.docs, db.retirements, db.reviews, db.changeGates, db.handovers,
       async () => checkBatchRowsInTx(cleanRows, userId, role)
     )
     const invalid = checkedRows.filter((r) => r.error)
@@ -352,7 +364,7 @@ export const useRetirementStore = defineStore('retirement', () => {
   async function runBatchSubmitItem(item, ctx) {
     const nowIso = new Date().toISOString()
     let result = { status: 'error' }
-    await db.transaction('rw', db.docs, db.retirements, db.retirementBatches, db.reviews, db.handovers, async () => {
+    await db.transaction('rw', db.docs, db.retirements, db.retirementBatches, db.reviews, db.changeGates, db.handovers, async () => {
       const { docId, replacementDocId, reason, batchIndex } = item.payload
       // 幂等：同一批次已为该文档建立在途/任意退役单（重放、重复提交）
       const existed = await db.retirements
@@ -387,6 +399,9 @@ export const useRetirementStore = defineStore('retirement', () => {
       const pendingReview = await db.reviews
         .where('docId').equals(docId).filter((rv) => rv.status === 'pending').first()
       if (pendingReview) { result = { status: 'in-review', title: doc.title }; return }
+      const activeGate = await db.changeGates
+        .where('docId').equals(docId).filter((g) => g.status === 'pending_impact' || g.status === 'pending_approval').first()
+      if (activeGate) { result = { status: 'in-gate', title: doc.title }; return }
       const handover = await db.handovers
         .filter((h) => (h.items || []).some((i) => i.docId === docId && isItemOpen(i))).first()
       if (handover) { result = { status: 'in-handover', title: doc.title }; return }
@@ -475,7 +490,7 @@ export const useRetirementStore = defineStore('retirement', () => {
 
     await db.transaction(
       'rw',
-      db.retirements, db.retirementBatches, db.docs, db.shares, db.gapTickets, db.reviews, db.handovers,
+      db.retirements, db.retirementBatches, db.docs, db.shares, db.gapTickets, db.reviews, db.changeGates, db.handovers,
       async () => {
         const r = await db.retirements.get(id)
         if (!r) { result = { status: 'missing' }; return }
@@ -510,11 +525,15 @@ export const useRetirementStore = defineStore('retirement', () => {
           .filter((x) => x.id !== r.id && (isRetirementActive(x) || isRetirementOpen(x)) && x.replacementDocId === doc.id)
           .first()
         if (usedByOther) { result = { status: 'used-as-replacement', title: usedByOther.docTitle || doc.title }; return }
-        // 旧文档审批期间进入评审/交接 → 驳回本次执行，发起人处理完后可重新发起
+        // 旧文档审批期间进入评审/交接/门禁 → 驳回本次执行，发起人处理完后可重新发起
         const pendingReview = await db.reviews
           .where('docId').equals(doc.id)
           .filter((rv) => rv.status === 'pending').first()
         if (pendingReview) { result = { status: 'in-review', title: doc.title }; return }
+        const activeGate = await db.changeGates
+          .where('docId').equals(doc.id)
+          .filter((g) => g.status === 'pending_impact' || g.status === 'pending_approval').first()
+        if (activeGate) { result = { status: 'in-gate', title: doc.title }; return }
         const handover = await db.handovers.filter((h) => (h.items || []).some((i) => i.docId === doc.id && isItemOpen(i))).first()
         if (handover) { result = { status: 'in-handover', title: doc.title }; return }
 
@@ -932,7 +951,7 @@ async function actorOf(ctx) {
 registerBatchHandler({
   module: 'retirement',
   action: 'batch-submit',
-  setupTables: () => [db.users, db.docs, db.retirements, db.retirementBatches, db.reviews, db.handovers],
+  setupTables: () => [db.users, db.docs, db.retirements, db.retirementBatches, db.reviews, db.changeGates, db.handovers],
   setup: setupRetirementBatch,
   afterFinish: traceRetirementBatchFinish,
   runItem: async (item, ctx) => {
@@ -946,7 +965,7 @@ registerBatchHandler({
   module: 'retirement',
   action: 'batch-approve',
   setupTables: () => [
-    db.users, db.docs, db.retirements, db.retirementBatches, db.shares, db.gapTickets, db.reviews, db.handovers
+    db.users, db.docs, db.retirements, db.retirementBatches, db.shares, db.gapTickets, db.reviews, db.changeGates, db.handovers
   ],
   afterFinish: traceRetirementBatchFinish,
   runItem: async (item, ctx) => {

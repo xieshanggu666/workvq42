@@ -5,6 +5,7 @@ import { useShareStore } from '@/stores/share'
 import { useReviewStore } from '@/stores/review'
 import { useAccessStore } from '@/stores/access'
 import { useRetirementStore } from '@/stores/retirement'
+import { useGateStore } from '@/stores/gate'
 import { formatDate, formatFull } from '@/utils/format'
 import { docUrl, shareUrl, shareStatus, shareStatusLabel } from '@/utils/share'
 import { canCreateShare, canRevokeShare, GUEST_ID } from '@/utils/permission'
@@ -16,6 +17,7 @@ const shareStore = useShareStore()
 const reviewStore = useReviewStore()
 const accessStore = useAccessStore()
 const retirementStore = useRetirementStore()
+const gateStore = useGateStore()
 
 const shares = ref([])
 const perm = ref('view')
@@ -37,6 +39,7 @@ const shareCtx = computed(() => ({
   role: auth.user?.role,
   grant: props.doc ? accessStore.grantOf(props.doc.id, auth.user?.id) : null,
   pendingReview: props.doc ? reviewStore.pendingReviewOf(props.doc.id) : null,
+  activeGate: props.doc ? gateStore.openGateOfDoc(props.doc.id) : null,
   activeRetirement: props.doc ? retirementStore.activeRetirementOfDoc(props.doc.id) : null
 }))
 // 链接权限不得超过创建者自身权限：无正文写入资格时「可编辑」选项置灰（store 事务内仍会拒绝）
@@ -46,7 +49,7 @@ const canRevoke = (s) => canRevokeShare(s, props.doc, auth.user?.id, auth.user?.
 
 async function load() {
   if (!props.doc) return
-  await Promise.all([reviewStore.loadAll(), accessStore.loadAll(), retirementStore.loadAll()])
+  await Promise.all([reviewStore.loadAll(), accessStore.loadAll(), retirementStore.loadAll(), gateStore.loadAll()])
   shares.value = await shareStore.listSharesOfDoc(props.doc.id)
 }
 
@@ -60,9 +63,11 @@ async function create() {
   }
   errorMsg.value = res.status === 'guest'
     ? '请先登录后再生成共享链接'
-    : res.status === 'denied'
-      ? (perm.value === 'edit' ? '你没有该文档的编辑权限，只能生成「仅查看」链接' : '当前状态不允许生成共享链接（文档可能已退役或无查看权限）')
-      : '生成共享链接失败，请刷新后重试'
+    : res.status === 'gate-open'
+      ? '该文档正在发布门禁中，链接已挂起，门禁结束后再生成新链接'
+      : res.status === 'denied'
+        ? (perm.value === 'edit' ? '你没有该文档的编辑权限，只能生成「仅查看」链接' : '当前状态不允许生成共享链接（文档可能已退役或无查看权限）')
+        : '生成共享链接失败，请刷新后重试'
 }
 
 // 撤销：标记状态而非删除，链接端可明确提示「已撤销」；资格由 store 事务内复核
@@ -122,7 +127,10 @@ watch(canCreateEdit, (v) => { if (!v && perm.value === 'edit') perm.value = 'vie
 
         <div class="sec">
           <div class="sec-label">生成共享链接</div>
-          <div v-if="isGuest" class="hint">访客不能生成共享链接，请先登录知识库。</div>
+          <div v-if="shareCtx.activeGate" class="gate-hint">
+            🚦 该文档正在发布门禁（变更影响评估）中，现有有效链接已挂起；门禁放行或回退后恢复，期间暂不生成新链接。
+          </div>
+          <div v-else-if="isGuest" class="hint">访客不能生成共享链接，请先登录知识库。</div>
           <template v-else>
             <div class="create-row">
               <select v-model="perm" class="perm">
@@ -169,6 +177,7 @@ watch(canCreateEdit, (v) => { if (!v && perm.value === 'edit') perm.value = 'vie
 .url { flex: 1; background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .hint { color: var(--text-3); font-size: 12px; margin-top: 6px; }
 .error-hint { color: var(--danger); font-size: 12px; margin-top: 6px; }
+.gate-hint { font-size: 12px; color: #4338ca; background: #eef2ff; border: 1px solid #818cf8; border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; line-height: 1.6; }
 .create-row { display: flex; gap: 8px; }
 .perm { border: 1px solid var(--border); border-radius: 6px; padding: 6px 8px; font-size: 13px; }
 .share-list { margin-top: 10px; display: flex; flex-direction: column; gap: 8px; }
@@ -179,6 +188,7 @@ watch(canCreateEdit, (v) => { if (!v && perm.value === 'edit') perm.value = 'vie
 .surl code { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .badge { flex-shrink: 0; font-size: 11px; padding: 0 8px; border-radius: 999px; line-height: 18px; }
 .badge.active { background: #e3f7ef; color: var(--accent); }
+.badge.suspended { background: #e0e7ff; color: #4338ca; }
 .badge.expired { background: var(--panel-2); color: var(--text-3); border: 1px solid var(--border); }
 .badge.revoked { background: #ffe9ea; color: var(--danger); }
 .smeta { color: var(--text-3); font-size: 11px; margin-top: 2px; }

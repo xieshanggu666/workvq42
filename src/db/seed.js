@@ -372,8 +372,9 @@ const seedReview5 = {
 // v4 版本快照回填与 doc-2 恢复演示（v2 误删 + rev-5 恢复评审通过 + v3 恢复边界标记）；
 // v5 知识保鲜演示（doc-8 逾期整改中 / doc-1 修订送审中 / doc-5 复核通过 / doc-6 保鲜运行中）；
 // v6 责任交接演示（ho-1 待确认 / ho-2 已完成含历史归属 / ho-3 并发变更失败回退）；
-// v7 分类复核策略演示（fp-1 产品设计分类 180 天：doc-9 继承策略，doc-4 文档级覆盖 + 在途复核单保留快照）
-const SEED_VER = '7'
+// v7 分类复核策略演示（fp-1 产品设计分类 180 天：doc-9 继承策略，doc-4 文档级覆盖 + 在途复核单保留快照）；
+// v8 知识变更影响评估与发布门禁演示（gate-1 doc-3 待确认影响并暂停引用 / gate-2 doc-5 已放行留痕）
+const SEED_VER = '8'
 
 async function isSeeded() {
   return (await getMeta('seeded')) === SEED_VER
@@ -779,9 +780,108 @@ async function ensurePolicySeed() {
   }
 }
 
+// ---- 知识变更影响评估与发布门禁演示（v8 增量种子）----
+// doc-1 已有评审中演示，这里选 doc-3（API 鉴权与权限模型）做一条流转中的门禁：
+// - 编辑者陈思涵提交修订版本（gate-1，待负责人/管理员确认影响）；
+// - 冻结受影响项：问答引用（gap-3 的问题命中本文档）、有效共享链接（doc-3 无共享链接，演示 0 条也可）；
+// - 文档锁定（activeGateId），问答引用暂停；doc-1 的共享链接 sh-1 不动。
+// 另放一条已放行的历史门禁 gate-2（doc-5 新成员入职指引）演示版本回写与影响项恢复的完整留痕。
+async function ensureGateSeed() {
+  if ((await db.changeGates.count()) > 0) return
+
+  const doc3 = await db.docs.get('doc-3')
+  if (doc3 && !(await db.changeGates.get('gate-1'))) {
+    const pendingBody = '<h2>统一鉴权链路</h2><p>所有请求进入网关后，先校验 <b>Token</b> 再校验 <i>权限点</i>，二者均通过才放行。</p><h3>角色与权限点</h3><ul><li>admin：全部权限，可审批发布门禁</li><li>editor：可新增与编辑，提交版本走影响评估</li><li>viewer：只读</li></ul><blockquote>文档级可见性：public / team / private；发布门禁期间共享链接临时挂起。</blockquote>'
+    const nowIso = ago(2 * h)
+    const qaItems = [{
+      id: 'gi-qa-gap-3', type: 'qa', refId: 'gap-3',
+      title: '新成员如何申请知识库的管理员权限？', keywords: ['新成员如何申请知识库的管理员权限？'], state: 'affected'
+    }]
+    // doc-3 无共享链接，share 列表为空；缺口工单 gap-3 已解决不列入（演示问答引用仍可命中已解决问题）
+    await db.changeGates.add({
+      id: 'gate-1',
+      docId: 'doc-3',
+      docTitle: 'API 鉴权与权限模型',
+      status: 'pending_impact',
+      submittedBy: 'u-chen',
+      submittedAt: nowIso,
+      baseVersion: (doc3.versions || []).length || 1,
+      snapshot: {
+        title: 'API 鉴权与权限模型',
+        body: pendingBody,
+        categoryId: 'c-dev', tagIds: ['t-api', 't-security'], visibility: 'team'
+      },
+      changeFields: ['body'],
+      ownerConfirmedBy: null,
+      ownerConfirmedAt: null,
+      ownerNote: '',
+      decidedBy: null,
+      decidedAt: null,
+      decisionNote: '',
+      releaseVersion: null,
+      heldShareIds: [],
+      impact: {
+        qa: qaItems,
+        gap: [],
+        share: [],
+        all: qaItems,
+        counts: { qa: 1, gap: 0, share: 0, total: 1 }
+      },
+      timeline: [
+        { action: 'submit', by: 'u-chen', at: nowIso, note: '补充网关放行顺序与门禁期间链接挂起说明，请评估对鉴权问答的影响。' }
+      ]
+    })
+    // 文档锁定：正文保持旧版、问答引用暂停
+    await db.docs.update('doc-3', { activeGateId: 'gate-1' })
+  }
+
+  // 已放行的历史门禁：doc-5 新成员入职指引（仅留痕，不改正文）
+  const doc5 = await db.docs.get('doc-5')
+  if (doc5 && !(await db.changeGates.get('gate-2'))) {
+    const releasedAt = ago(4 * d)
+    const qa2 = [{
+      id: 'gi-qa-onboarding', type: 'qa', refId: 'qa-onboarding',
+      title: '新成员入职第一天要完成哪些事？', keywords: ['新成员入职第一天要完成哪些事？'], state: 'released', decidedAt: releasedAt
+    }]
+    const sh2 = [{
+      id: 'gi-share-sh-3', type: 'share', refId: 'sh-3',
+      title: 'share-onboard01', permission: 'view', state: 'released', decidedAt: releasedAt
+    }]
+    await db.changeGates.add({
+      id: 'gate-2',
+      docId: 'doc-5',
+      docTitle: '新成员入职指引',
+      status: 'released',
+      submittedBy: 'u-admin',
+      submittedAt: ago(5 * d),
+      baseVersion: 1,
+      snapshot: {
+        title: '新成员入职指引',
+        body: doc5.body,
+        categoryId: 'c-life', tagIds: ['t-onboarding', 't-faq'], visibility: 'public'
+      },
+      changeFields: ['body'],
+      ownerConfirmedBy: 'u-admin',
+      ownerConfirmedAt: ago(5 * d) + 2 * 3600 * 1000,
+      ownerNote: '入职问答与外发链接影响已确认。',
+      decidedBy: 'u-admin',
+      decidedAt: releasedAt,
+      decisionNote: '影响可控，放行发布。',
+      releaseVersion: null,
+      restoredShareIds: ['sh-3'],
+      impact: { qa: qa2, gap: [], share: sh2, all: [...qa2, ...sh2], counts: { qa: 1, gap: 0, share: 1, total: 2 } },
+      timeline: [
+        { action: 'submit', by: 'u-admin', at: ago(5 * d), note: '完善入职第一天流程。' },
+        { action: 'impact-confirm', by: 'u-admin', at: ago(5 * d) + 2 * 3600 * 1000, note: '入职问答与外发链接影响已确认。' },
+        { action: 'release', by: 'u-admin', at: releasedAt, note: '影响可控，放行发布。' }
+      ]
+    })
+  }
+}
+
 export async function ensureSeeded() {
   if (await isSeeded()) return
-  await db.transaction('rw', db.users, db.categories, db.tags, db.docs, db.comments, db.shares, db.favorites, db.ratings, db.reviews, db.gapTickets, db.accessRequests, db.freshnessTickets, db.handovers, db.freshnessPolicies, async () => {
+  await db.transaction('rw', db.users, db.categories, db.tags, db.docs, db.comments, db.shares, db.favorites, db.ratings, db.reviews, db.gapTickets, db.accessRequests, db.freshnessTickets, db.handovers, db.freshnessPolicies, db.changeGates, async () => {
     if ((await db.users.count()) === 0) {
       await db.users.bulkAdd(seedUsers)
       await db.categories.bulkAdd(seedCategories)
@@ -799,6 +899,7 @@ export async function ensureSeeded() {
     await ensureFreshnessSeed()
     await ensureHandoverSeed()
     await ensurePolicySeed()
+    await ensureGateSeed()
   })
   await setMeta('seeded', SEED_VER)
 }

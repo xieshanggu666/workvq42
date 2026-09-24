@@ -19,7 +19,8 @@
     "test:handover": "mkdir -p node_modules/.cache && esbuild scripts/run-handover-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/handover-test.mjs --alias:@=./src && node node_modules/.cache/handover-test.mjs",
     "test:retirement": "mkdir -p node_modules/.cache && esbuild scripts/run-retirement-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/retirement-test.mjs --alias:@=./src && node node_modules/.cache/retirement-test.mjs",
     "test:retirement-batch": "mkdir -p node_modules/.cache && esbuild scripts/run-orchestration-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/orchestration-test.mjs --alias:@=./src && node node_modules/.cache/orchestration-test.mjs",
-    "test:orchestration": "mkdir -p node_modules/.cache && esbuild scripts/run-orchestration-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/orchestration-test.mjs --alias:@=./src && node node_modules/.cache/orchestration-test.mjs"
+    "test:orchestration": "mkdir -p node_modules/.cache && esbuild scripts/run-orchestration-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/orchestration-test.mjs --alias:@=./src && node node_modules/.cache/orchestration-test.mjs",
+    "test:gate": "mkdir -p node_modules/.cache && esbuild scripts/run-gate-test.mjs --bundle --platform=node --format=esm --outfile=node_modules/.cache/gate-test.mjs --alias:@=./src && node node_modules/.cache/gate-test.mjs"
   },
   "dependencies": {
     "dexie": "^4.0.8",

@@ -19,24 +19,30 @@ export const useShareStore = defineStore('share', () => {
     const now = new Date()
     const nowIso = now.toISOString()
     let result = { status: 'error' }
-    await db.transaction('rw', db.docs, db.shares, db.reviews, db.accessRequests, async () => {
+    await db.transaction('rw', db.docs, db.shares, db.reviews, db.changeGates, db.accessRequests, async () => {
       const doc = await db.docs.get(docId)
       if (!doc) { result = { status: 'missing' }; return }
-      // 事务内重读评审与限时授权：评审锁定/授权撤销后创建资格立即按最新状态判定
+      // 事务内重读评审/门禁与限时授权：评审锁定、发布门禁挂起/授权撤销后创建资格立即按最新状态判定
       const pendingReview = await db.reviews
         .where('docId').equals(docId)
         .filter((rv) => rv.status === 'pending').first()
+      const activeGate = await db.changeGates
+        .where('docId').equals(docId)
+        .filter((g) => g.status === 'pending_impact' || g.status === 'pending_approval').first()
       const grantReqs = await db.accessRequests
         .where('docId').equals(docId)
         .filter((r) => r.applicantId === userId).toArray()
       const grant = grantReqs.find((r) => r.status === 'approved' && !r.revokedAt) || null
       // 已退役文档为只读归档（退役时已批量撤销链接），归档期间不再生成新链接
       const activeRetirement = doc.retirement?.status === 'approved' ? doc.retirement : null
+      // 发布门禁流转中：现有链接已挂起，期间不生成新链接
+      if (activeGate) { result = { status: 'gate-open' }; return }
       if (!canCreateShare(doc, permission, {
         userId,
         role: currentUser?.role,
         grant,
         pendingReview,
+        activeGate,
         activeRetirement,
         now
       })) {

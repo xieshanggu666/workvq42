@@ -4,6 +4,7 @@ import { useKbStore } from '@/stores/kb'
 import { useReviewStore } from '@/stores/review'
 import { useFreshnessStore } from '@/stores/freshness'
 import { useRetirementStore } from '@/stores/retirement'
+import { useGateStore } from '@/stores/gate'
 import { FRESH, isFreshnessEnabled, isFreshTicketOpen, cycleDaysLabel, dueText } from '@/utils/freshness'
 
 const props = defineProps({
@@ -13,6 +14,7 @@ const kb = useKbStore()
 const reviewStore = useReviewStore()
 const freshnessStore = useFreshnessStore()
 const retirementStore = useRetirementStore()
+const gateStore = useGateStore()
 
 const catName = computed(() => kb.catMap[props.doc.categoryId]?.name || '未分类')
 const tags = computed(() => (props.doc.tagIds || []).map((id) => kb.tagMap[id]).filter(Boolean))
@@ -43,12 +45,17 @@ const freshTitle = computed(() => {
 // 知识退役：生效退役的文档只读归档（搜索/问答已停止）
 const retired = computed(() => !!retirementStore.activeRetirementOfDoc(props.doc.id))
 
+// 发布门禁：流转中的门禁锁定正文、暂停问答引用、挂起共享链接
+const activeGate = computed(() => gateStore.openGateOfDoc(props.doc.id))
+const gateLabel = computed(() => activeGate.value?.status === 'pending_approval' ? '🚦 门禁待审批' : '🚦 门禁评估中')
+
 const visibilityLabel = { public: '公开', team: '团队', private: '私有' }
 </script>
 
 <template>
   <div class="docbadges">
     <span v-if="retired" class="pill rt-retired" title="已退役：停止搜索与问答引用，由替代文档承接">🗄 已退役</span>
+    <span v-if="activeGate" class="pill rt-gate" title="发布门禁流转中：正文锁定、问答引用暂停、共享链接挂起，负责人确认后管理员放行">{{ gateLabel }}</span>
     <span v-if="inReview" class="pill rv-review">⏳ 评审中</span>
     <span v-else-if="rejectedLast" class="pill rv-rejected">↩ 已驳回</span>
     <span v-if="freshPaused" class="pill fresh-paused" :title="freshTitle">{{ freshLabel }}</span>
@@ -64,6 +71,7 @@ const visibilityLabel = { public: '公开', team: '团队', private: '私有' }
 .v { font-size: 11px; }
 .rv-review { background: #b45309; color: #fff; font-size: 11px; }
 .rt-retired { background: #64748b; color: #fff; font-size: 11px; }
+.rt-gate { background: #4338ca; color: #fff; font-size: 11px; }
 .rv-rejected { background: var(--danger); color: #fff; font-size: 11px; }
 .fresh-paused { background: #0e7490; color: #fff; font-size: 11px; }
 .fresh-ok { background: #ecfeff; color: #0e7490; border: 1px solid #a5f3fc; font-size: 11px; }

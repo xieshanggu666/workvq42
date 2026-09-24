@@ -108,6 +108,15 @@ export class KnowledgeDB extends Dexie {
     this.version(13).stores({
       correctionTickets: 'id, status, docId, createdBy, claimedBy, reviewId, createdAt'
     })
+    // v14：知识变更影响评估与发布门禁
+    // - changeGates：编辑者提交版本后建立发布门禁，冻结本次受影响的问答引用、缺口工单与共享链接；
+    //   提交即暂停问答引用并挂起共享链接、锁定正文 → 负责人确认影响（pending_impact → pending_approval）
+    //   → 管理员审批放行（released：回写版本发布、恢复引用与链接）或回退（rolled_back：版本不发布、
+    //   恢复引用与链接）；负责人确认前/后管理员亦可驳回（rejected）。版本发布、引用、链接状态全程回写。
+    //   impact（受影响项快照与逐项状态）与 timeline 随记录读写留痕，不单独建索引。
+    this.version(14).stores({
+      changeGates: 'id, docId, status, submittedBy, ownerConfirmedBy, decidedBy, createdAt, decidedAt'
+    })
   }
 }
 

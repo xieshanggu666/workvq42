@@ -9,6 +9,7 @@ import { useAccessStore } from '@/stores/access'
 import { useFreshnessStore } from '@/stores/freshness'
 import { useHandoverStore } from '@/stores/handover'
 import { useRetirementStore } from '@/stores/retirement'
+import { useGateStore } from '@/stores/gate'
 import DocPill from '@/components/common/DocPill.vue'
 import MemberSelect from '@/components/common/MemberSelect.vue'
 import ShareDialog from '@/components/doc/ShareDialog.vue'
@@ -16,6 +17,7 @@ import ReviewPanel from '@/components/doc/ReviewPanel.vue'
 import CorrectionPanel from '@/components/doc/CorrectionPanel.vue'
 import FreshnessPanel from '@/components/doc/FreshnessPanel.vue'
 import RetirementPanel from '@/components/doc/RetirementPanel.vue'
+import GatePanel from '@/components/doc/GatePanel.vue'
 import AccessApplyCard from '@/components/doc/AccessApplyCard.vue'
 import AccessPanel from '@/components/doc/AccessPanel.vue'
 import { formatFull, formatDate, avatarColor } from '@/utils/format'
@@ -35,6 +37,7 @@ const accessStore = useAccessStore()
 const freshnessStore = useFreshnessStore()
 const handoverStore = useHandoverStore()
 const retirementStore = useRetirementStore()
+const gateStore = useGateStore()
 
 const doc = ref(null)
 const notFound = ref(false)
@@ -48,6 +51,8 @@ const mergeNotice = ref('')
 const reviewSubmittedNotice = ref('')
 // 已提交保鲜复核的提示（由编辑器「保鲜整改」跳转携带）
 const freshSubmittedNotice = ref('')
+// 已提交发布门禁的提示（由编辑器「发布门禁」跳转携带）
+const gateSubmittedNotice = ref('')
 
 const docId = computed(() => route.params.id)
 // 兼容旧数据：早期文档可能没有 versions 字段
@@ -134,7 +139,7 @@ async function submitRestore() {
 
 async function refresh() {
   if (!docId.value) return
-  await Promise.all([reviewStore.loadAll(), accessStore.loadAll(), freshnessStore.loadAll(), retirementStore.loadAll()])
+  await Promise.all([reviewStore.loadAll(), accessStore.loadAll(), freshnessStore.loadAll(), retirementStore.loadAll(), gateStore.loadAll()])
   const d = await kb.getDoc(docId.value)
   if (!d) { notFound.value = true; doc.value = null; return }
   notFound.value = false
@@ -151,9 +156,9 @@ async function refresh() {
 const activeGrant = computed(() => (doc.value ? accessStore.grantOf(doc.value.id, auth.user?.id) : null))
 // 是否可查看详情（随授权记录响应式变化：撤销/到期即时收回）
 const hasViewAccess = computed(() => doc.value ? canViewDoc(doc.value, auth.user?.id, null, activeGrant.value) : false)
-const canEdit = computed(() => canEditDoc(doc.value, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, grant: activeGrant.value, pendingReview: pendingReview.value, activeRetirement: activeRetirement.value }))
+const canEdit = computed(() => canEditDoc(doc.value, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, grant: activeGrant.value, pendingReview: pendingReview.value, activeGate: activeGate.value, activeRetirement: activeRetirement.value }))
 // 删除是破坏性操作：限时协作授权不授予删除权，独立于正文编辑资格判定；已退役文档不允许删除
-const canDelete = computed(() => canDeleteDoc(doc.value, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, pendingReview: pendingReview.value, activeRetirement: activeRetirement.value }))
+const canDelete = computed(() => canDeleteDoc(doc.value, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, pendingReview: pendingReview.value, activeGate: activeGate.value, activeRetirement: activeRetirement.value }))
 const isFav = computed(() => engagement.isFavorite(docId.value))
 const comments = computed(() => (doc.value ? kb.commentsOf(doc.value.id) : []))
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
@@ -165,6 +170,9 @@ const isOwnerOrAdmin = computed(() => doc.value && (auth.user?.role === 'admin' 
 const activeHandover = computed(() => (doc.value ? handoverStore.activeItemOfDoc(doc.value.id) : null))
 // 知识退役：本文档当前生效退役（已退役则只读，停止搜索/问答，引导至替代文档）
 const activeRetirement = computed(() => (doc.value ? retirementStore.activeRetirementOfDoc(doc.value.id) : null))
+// 发布门禁：本文档当前流转中的门禁（锁定正文、暂停问答引用、挂起共享链接）
+const activeGate = computed(() => (doc.value ? gateStore.openGateOfDoc(doc.value.id) : null))
+const gateLocked = computed(() => !!activeGate.value && auth.user?.role !== 'admin')
 
 async function doDelete() {
   if (!confirm('确定删除该文档？此操作不可恢复。')) return
@@ -179,6 +187,10 @@ async function doDelete() {
   }
   if (res?.status === 'is-replacement') {
     alert('该文档正作为某篇已退役文档的替代文档，请先撤销对应退役后再删除。')
+    return
+  }
+  if (res?.status === 'in-gate') {
+    alert('该文档存在流转中的发布门禁，请先完成审批或撤回门禁后再删除。')
     return
   }
   router.push('/docs')
@@ -209,6 +221,7 @@ onMounted(() => {
   mergeNotice.value = route.query.merged || ''
   reviewSubmittedNotice.value = route.query.reviewSubmitted || ''
   freshSubmittedNotice.value = route.query.freshSubmitted || ''
+  gateSubmittedNotice.value = route.query.gateSubmitted || ''
   refresh()
 })
 watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.value = false } })
@@ -234,8 +247,16 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
         <span>🧊 已提交保鲜复核：管理员复核通过后修订生效、问答引用恢复并重新计算复核周期；驳回则继续整改。</span>
         <button class="btn sm ghost" @click="freshSubmittedNotice = ''">知道了</button>
       </div>
+      <div v-if="gateSubmittedNotice" class="card gate-submitted-note">
+        <span>🚦 已提交发布门禁：已关联受影响的问答引用、缺口工单与共享链接并暂停引用/挂起链接，等待负责人确认影响、管理员审批放行。</span>
+        <button class="btn sm ghost" @click="gateSubmittedNotice = ''">知道了</button>
+      </div>
       <div v-if="reviewLocked" class="card review-lock">
         <span>⏳ 该文档正在评审中（{{ userById[pendingReview.submittedBy]?.name }} 发起）：当前展示的是评审前版本，正文已锁定，审批通过后更新。</span>
+      </div>
+      <div v-if="activeGate" class="card gate-banner">
+        <span>🚦 该文档正在发布门禁（{{ userById[activeGate.submittedBy]?.name }} 提交，{{ activeGate.status === 'pending_impact' ? '待负责人确认影响' : '待管理员审批' }}）：正文已锁定、问答引用已暂停、有效共享链接已挂起；{{ activeGate.status === 'released' ? '' : '管理员放行后版本才会发布。' }}</span>
+        <a class="gt-go" @click="router.push('/gates')">前往发布门禁 →</a>
       </div>
       <div v-if="freshTicket" class="card fresh-banner">
         <span>🧊 知识保鲜：本文档已超过复核周期（第 {{ freshTicket.round }} 轮，{{ freshTicket.status === 'submitted' ? '复核送审中' : freshTicket.status === 'rejected' ? '已驳回待整改' : '待整改' }}），问答引用已暂停；复核通过后自动恢复引用并重算周期。</span>
@@ -258,6 +279,7 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
             <button class="btn" @click="shareOpen = true">🔗 分享</button>
             <button v-if="canEdit" class="btn" @click="router.push('/docs/' + doc.id + '/edit')">✎ 编辑</button>
             <button v-else-if="reviewLocked" class="btn" disabled title="评审中，请等待管理员审批">🔒 评审中</button>
+            <button v-else-if="gateLocked" class="btn" disabled title="发布门禁流转中，请等待负责人确认/管理员审批">🚦 门禁中</button>
             <button v-if="canDelete" class="btn danger" @click="doDelete">🗑 删除</button>
           </div>
         </div>
@@ -282,6 +304,7 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
             <span v-if="versionReviewBadge(v)" class="vbadge" :class="'vb-' + versionReviewBadge(v).cls">{{ versionReviewBadge(v).text }}</span>
             <span v-if="freshVersionBadge(v)" class="vbadge vb-fresh">{{ freshVersionBadge(v).text }}</span>
             <span v-if="v.correction" class="vbadge vb-cor" :title="'纠错单 ' + v.correction.ticketId">🐞 纠错修订</span>
+            <span v-if="v.gate" class="vbadge vb-gate" :title="'门禁单 ' + v.gate.gateId">🚦 门禁放行</span>
             <span v-for="b in versionRestoreBadges(v)" :key="b.text" class="vbadge" :class="'vb-' + b.cls">{{ b.text }}</span>
             <span v-if="!v.snapshot" class="vnosnap" title="旧版本记录未保存内容快照，无法对比或恢复">无快照</span>
           </div>
@@ -351,6 +374,8 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
       <FreshnessPanel :doc="doc" />
 
       <RetirementPanel :doc="doc" />
+
+      <GatePanel :doc="doc" />
 
       <!-- 拥有者/管理员：审批访问申请、管理限时授权（撤销到期同步收回四处权限） -->
       <AccessPanel v-if="isOwnerOrAdmin" :doc="doc" />
@@ -466,16 +491,20 @@ watch(docId, () => { if (route.name === 'docDetail') { refresh(); showVersions.v
 .handover-banner { padding: 10px 18px; margin-bottom: 14px; font-size: 13px; color: #9a3412; background: #fff7ed; border-color: #fb923c; }
 .retire-banner { padding: 10px 18px; margin-bottom: 14px; font-size: 13px; color: #475569; background: #f8fafc; border-color: #cbd5e1; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
 .retire-banner .rt-go { color: var(--primary); font-weight: 600; cursor: pointer; white-space: nowrap; }
+.gate-banner { padding: 10px 18px; margin-bottom: 14px; font-size: 13px; color: #4338ca; background: #eef2ff; border-color: #818cf8; display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.gate-banner .gt-go { color: #4338ca; font-weight: 600; cursor: pointer; white-space: nowrap; }
 .owner-his { margin-right: 14px; color: var(--text-2); }
 .owner-his em { font-style: normal; color: var(--text-3); font-size: 12px; }
 .owner-cur { color: var(--text); font-weight: 600; }
 .review-submitted-note { padding: 10px 20px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; color: #15803d; background: #f0fdf4; border-color: #16a34a; }
 .fresh-submitted-note { padding: 10px 20px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; color: #155e75; background: #ecfeff; border-color: #22d3ee; }
+.gate-submitted-note { padding: 10px 20px; margin-bottom: 14px; display: flex; justify-content: space-between; align-items: center; gap: 12px; font-size: 13px; color: #4338ca; background: #eef2ff; border-color: #818cf8; }
 .vbadge { font-size: 11px; padding: 1px 8px; border-radius: 999px; }
 .vb-ok { background: #dcfce7; color: #15803d; }
 .vb-no { background: #fee2e2; color: #b91c1c; }
 .vb-wait { background: #fef3c7; color: #b45309; }
 .vb-fresh { background: #cffafe; color: #0e7490; }
 .vb-cor { background: #ffe4e6; color: #be123c; }
+.vb-gate { background: #e0e7ff; color: #4338ca; }
 .c-review-tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; background: var(--primary-weak); color: var(--primary); }
 </style>

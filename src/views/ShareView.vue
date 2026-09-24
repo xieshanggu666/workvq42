@@ -6,6 +6,7 @@ import { useKbStore } from '@/stores/kb'
 import { useAuthStore } from '@/stores/auth'
 import { useReviewStore } from '@/stores/review'
 import { useRetirementStore } from '@/stores/retirement'
+import { useGateStore } from '@/stores/gate'
 import DocPill from '@/components/common/DocPill.vue'
 import RichEditor from '@/components/doc/RichEditor.vue'
 import { formatFull } from '@/utils/format'
@@ -18,6 +19,7 @@ const kb = useKbStore()
 const auth = useAuthStore()
 const reviewStore = useReviewStore()
 const retirementStore = useRetirementStore()
+const gateStore = useGateStore()
 
 const share = ref(null)
 const doc = ref(null)
@@ -37,14 +39,17 @@ const savedToast = ref('')
 const token = computed(() => route.params.token)
 const backupKey = computed(() => 'kb:share-backup:' + (doc.value?.id || ''))
 const userById = computed(() => Object.fromEntries(auth.users.map((u) => [u.id, u])))
-// 编辑入口与链接状态、评审锁定统一走 canEditDoc：撤销/过期/评审锁定立即失去编辑权限
+// 编辑入口与链接状态、评审/门禁锁定统一走 canEditDoc：撤销/过期/门禁挂起立即失去编辑权限
 const editable = computed(() => canEditDoc(doc.value, {
   userId: GUEST_ID,
   role: null,
   share: share.value,
-  pendingReview: reviewStore.pendingReviewOf(doc.value?.id)
+  pendingReview: reviewStore.pendingReviewOf(doc.value?.id),
+  activeGate: gateStore.openGateOfDoc(doc.value?.id)
 }))
 const reviewLockedShare = computed(() => !!reviewStore.pendingReviewOf(doc.value?.id))
+// 发布门禁流转中：共享链接被挂起，访客只读暂停（放行/回退后恢复）
+const gateLockedShare = computed(() => (doc.value ? gateStore.openGateOfDoc(doc.value.id) : null))
 // 共享文档在分享后被退役：链接（若仍有效）只能查看只读归档，编辑入口随退役关闭，
 // 并提示访客通过知识库登录后查看替代文档（无权限时走访问申请）
 const retiredShare = computed(() => (doc.value ? retirementStore.activeRetirementOfDoc(doc.value.id) : null))
@@ -58,11 +63,19 @@ async function resolve(tokenVal) {
   doc.value = null
   editing.value = false
   conflict.value = null
-  await Promise.all([reviewStore.loadAll(), retirementStore.loadAll()])
+  await Promise.all([reviewStore.loadAll(), retirementStore.loadAll(), gateStore.loadAll()])
   const s = await db.shares.where('token').equals(tokenVal).first()
   if (!s) { status.value = 'notfound'; return }
   const st = shareStatus(s)
   if (st === 'revoked') { status.value = 'revoked'; return }
+  if (st === 'suspended') {
+    // 门禁挂起：链接记录仍在，但临时暂停访问；展示挂起提示（放行/回退后恢复）
+    share.value = s
+    const gd = await db.docs.get(s.docId)
+    doc.value = gd || null
+    status.value = 'suspended'
+    return
+  }
   if (st === 'expired') { status.value = 'expired'; return }
   // 直接读库，保证展示与编辑基线都是最新版本
   const d = await kb.getDocFresh(s.docId)
@@ -110,12 +123,14 @@ async function saveEdit(force = false) {
       baseVersion: baseVersion.value, base: baseDoc.value, force, shareToken: token.value
     })
     if (!res || res.status === 'missing') { status.value = 'notfound'; return }
-    if (res.status === 'guest' || res.status === 'access-denied' || res.status === 'review-locked') {
+    if (res.status === 'guest' || res.status === 'access-denied' || res.status === 'review-locked' || res.status === 'gate-locked') {
       conflict.value = null
       editing.value = false
       savedToast.value = res.status === 'review-locked'
         ? '文档正在评审中，暂无法通过共享链接保存'
-        : '共享链接已失效或无编辑权限，无法保存'
+        : res.status === 'gate-locked'
+          ? '文档正在发布门禁中，共享链接已挂起，暂无法保存'
+          : '共享链接已失效或无编辑权限，无法保存'
       setTimeout(() => { savedToast.value = '' }, 3000)
       await resolve(token.value)
       return
@@ -159,6 +174,10 @@ watch(token, () => resolve(token.value))
     <div v-if="status === 'loading'" class="empty card"><div class="ico">⏳</div>正在加载共享文档…</div>
     <div v-else-if="status === 'notfound'" class="empty card"><div class="ico">🚫</div>共享链接无效或文档不存在</div>
     <div v-else-if="status === 'revoked'" class="empty card"><div class="ico">⛔</div>该共享链接已被撤销，如需访问请联系分享者重新生成</div>
+    <div v-else-if="status === 'suspended'" class="empty card">
+      <div class="ico">🚦</div>该共享链接因文档正在「知识变更影响评估与发布门禁」中已临时挂起
+      <div class="suspended-sub">门禁放行或回退后链接会自动恢复，请稍后再访问，或联系分享者了解进度。</div>
+    </div>
     <div v-else-if="status === 'expired'" class="empty card"><div class="ico">⏰</div>该共享链接已过期，如需访问请联系分享者重新生成</div>
 
     <template v-else-if="doc">
@@ -169,6 +188,10 @@ watch(token, () => resolve(token.value))
 
       <div v-if="reviewLockedShare" class="card review-lock-banner">
         ⏳ 该文档正在评审中，正文暂不可通过共享链接修改；审批通过后将发布新版本。
+      </div>
+
+      <div v-if="gateLockedShare" class="card gate-lock-banner">
+        🚦 该文档正在发布门禁（变更影响评估）中，共享链接已挂起；管理员放行后版本发布、链接恢复，回退则维持当前内容。
       </div>
 
       <div v-if="retiredShare" class="card retired-banner">
@@ -237,6 +260,8 @@ watch(token, () => resolve(token.value))
 .share-banner { padding: 12px 16px; display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; background: var(--primary-weak); border-color: var(--primary); color: var(--primary); font-weight: 500; }
 .owner { font-weight: 400; font-size: 12px; opacity: 0.8; }
 .review-lock-banner { padding: 10px 16px; margin-bottom: 14px; font-size: 13px; color: #b45309; background: #fffbeb; border-color: #f59e0b; }
+.gate-lock-banner { padding: 10px 16px; margin-bottom: 14px; font-size: 13px; color: #4338ca; background: #eef2ff; border-color: #818cf8; }
+.suspended-sub { margin-top: 10px; font-size: 13px; color: var(--text-3); }
 .retired-banner { padding: 12px 16px; margin-bottom: 14px; font-size: 13px; color: #475569; background: #f8fafc; border-color: #cbd5e1; }
 .rb-line { font-weight: 600; }
 .rb-sub { margin-top: 4px; color: var(--text-2); font-size: 12.5px; }

@@ -8,9 +8,11 @@ import { useCorrectionStore } from '@/stores/correction'
 import { useAccessStore } from '@/stores/access'
 import { useFreshnessStore } from '@/stores/freshness'
 import { useRetirementStore } from '@/stores/retirement'
+import { useGateStore } from '@/stores/gate'
 import { canViewDoc } from '@/utils/permission'
 import { isDocCitable } from '@/utils/freshness'
 import { isDocRetireCitable } from '@/utils/retirement'
+import { isDocGateCitable } from '@/utils/gate'
 import { extractKeywords, scoreDoc } from '@/utils/qa'
 import { latestRestoreInfo } from '@/utils/version'
 import { gapStatusLabel } from '@/utils/gap'
@@ -26,6 +28,7 @@ const correctionStore = useCorrectionStore()
 const accessStore = useAccessStore()
 const freshnessStore = useFreshnessStore()
 const retirementStore = useRetirementStore()
+const gateStore = useGateStore()
 
 const question = ref('')
 const asked = ref('')
@@ -45,15 +48,25 @@ const suggestions = ['Vue 如何初始化项目?', 'Dexie 怎么进行查询?', 
 function grantOf(d) { return accessStore.grantOf(d.id, auth.user?.id) }
 function freshTicketOf(d) { return freshnessStore.activeTicketOf(d.id) }
 function retirementOf(d) { return retirementStore.activeRetirementOfDoc(d.id) }
+// 发布门禁流转中的文档：问答引用暂停（门禁放行后恢复并指向新版本）
+function gateOf(d) { return gateStore.openGateOfDoc(d.id) }
 const citableNow = (d) =>
   isDocCitable(d, freshTicketOf(d), freshnessStore.now) &&
-  isDocRetireCitable(d, retirementOf(d))
+  isDocRetireCitable(d, retirementOf(d)) &&
+  isDocGateCitable(d, gateOf(d))
 const cites = computed(() => rawCites.value.filter((c) => canViewDoc(c, auth.user?.id, null, grantOf(c)) && citableNow(c)))
 const related = computed(() => rawRelated.value.filter((d) => canViewDoc(d, auth.user?.id, null, grantOf(d)) && citableNow(d)))
 // 已渲染答案中被收回的引用数（限时授权撤销/到期、知识保鲜暂停、知识退役导致）
 const revokedCount = computed(() => rawCites.value.length - cites.value.length)
 // 其中因知识保鲜到期暂停引用的篇数（用于给出针对性提示）
 const freshnessPausedCount = computed(() => rawCites.value.filter((c) => canViewDoc(c, auth.user?.id, null, grantOf(c)) && !isDocCitable(c, freshTicketOf(c), freshnessStore.now)).length)
+// 其中因发布门禁流转暂停引用的篇数
+const gatePausedCount = computed(() => rawCites.value.filter((c) =>
+  canViewDoc(c, auth.user?.id, null, grantOf(c)) &&
+  isDocCitable(c, freshTicketOf(c), freshnessStore.now) &&
+  isDocRetireCitable(c, retirementOf(c)) &&
+  !isDocGateCitable(c, gateOf(c))
+).length)
 // 其中因知识退役停止引用的篇数
 const retiredCount = computed(() => rawCites.value.filter((c) =>
   canViewDoc(c, auth.user?.id, null, grantOf(c)) &&
@@ -92,6 +105,9 @@ const answerText = computed(() => {
   if (revokedCount.value && !cites.value.length) {
     if (freshnessPausedCount.value) {
       return '该问题此前命中的内容已超过复核周期、正在保鲜复核中，问答引用已暂停。待编辑者修订并经管理员复核通过、重算复核周期后会恢复引用。'
+    }
+    if (gatePausedCount.value) {
+      return '该问题此前命中的内容正在知识变更影响评估与发布门禁中，问答引用已暂停。待负责人确认影响、管理员审批放行后恢复引用并指向新版本。'
     }
     if (retiredCount.value) {
       return '该问题此前命中的内容已被知识退役（停止问答引用），请改看其指定的替代文档；如替代文档无访问权限，可在替代文档页申请权限。'
@@ -200,21 +216,25 @@ function answering() {
     const tagNames = kb.tags
     // 可见但处于知识保鲜暂停期（周期到点/复核中）的命中：不作为引用来源，仅记录篇数给出提示
     let pausedHits = 0
+    // 可见但处于发布门禁流转中的命中：不作为引用来源，单独统计并提示
+    let gatePausedHits = 0
     // 可见但已知识退役的命中：不作为引用来源，单独统计并引导转看替代文档
     let retiredHitCount = 0
-    // 权限：撤销/到期的授权文档不再作为问答引用来源；知识保鲜到期/复核中、知识退役的文档均不参与问答引用
+    // 权限：撤销/到期的授权文档不再作为问答引用来源；知识保鲜到期/复核中、发布门禁流转中、知识退役的文档均不参与问答引用
     const hits = kb.docs
       .filter((d) => canViewDoc(d, auth.user?.id, null, grantOf(d)))
       .map((d) => {
         const bodyText = stripHtml(d.body)
         const freshOk = isDocCitable(d, freshTicketOf(d), freshnessStore.now)
         const retireOk = isDocRetireCitable(d, retirementOf(d))
+        const gateOk = isDocGateCitable(d, gateOf(d))
         return {
           doc: d,
           bodyText,
           retired: !retireOk,
-          citable: freshOk && retireOk,
+          citable: freshOk && retireOk && gateOk,
           freshPaused: !freshOk,
+          gatePaused: freshOk && retireOk && !gateOk,
           score: scoreDoc(d, keywords, tagNames, bodyText)
         }
       })
@@ -222,6 +242,7 @@ function answering() {
       .sort((a, b) => b.score - a.score)
 
     pausedHits = hits.filter((x) => x.freshPaused && !x.retired).length
+    gatePausedHits = hits.filter((x) => x.gatePaused).length
     retiredHitCount = hits.filter((x) => x.retired).length
     retiredHits.value = hits.filter((x) => x.retired).map((x) => x.doc)
     const citableHits = hits.filter((x) => x.citable)
@@ -230,15 +251,18 @@ function answering() {
     if (!top) {
       answered.value = true
       answer.value = retiredHitCount
-        ? '与「' + asked.value + '」相关的内容已被知识退役、停止问答引用，请改看其指定的替代文档' + (pausedHits ? '；另有部分文档正在保鲜复核中' : '') + '。你也可以直接在文档库中查看原文。'
-        : pausedHits
-          ? '与「' + asked.value + '」相关的内容已超过复核周期、正在保鲜复核中，已暂停问答引用。待编辑者修订并经管理员复核通过后会恢复引用，你也可以直接在文档库中查看原文。'
-          : '很抱歉，知识库中暂时没有与「' + asked.value + '」直接匹配的内容。建议你换一种表述，或浏览文档库 / 使用全局搜索。'
+        ? '与「' + asked.value + '」相关的内容已被知识退役、停止问答引用，请改看其指定的替代文档' + (pausedHits || gatePausedHits ? '；另有部分文档正在保鲜复核或发布门禁中' : '') + '。你也可以直接在文档库中查看原文。'
+        : gatePausedHits
+          ? '与「' + asked.value + '」相关的内容正在知识变更影响评估与发布门禁中，已暂停问答引用。待负责人确认影响、管理员审批放行后恢复引用并指向新版本' + (pausedHits ? '；另有部分文档正在保鲜复核中' : '') + '。你也可以直接在文档库中查看原文。'
+          : pausedHits
+            ? '与「' + asked.value + '」相关的内容已超过复核周期、正在保鲜复核中，已暂停问答引用。待编辑者修订并经管理员复核通过后会恢复引用，你也可以直接在文档库中查看原文。'
+            : '很抱歉，知识库中暂时没有与「' + asked.value + '」直接匹配的内容。建议你换一种表述，或浏览文档库 / 使用全局搜索。'
       return
     }
 
     const extraNotes = []
     if (pausedHits) extraNotes.push('另有 ' + pausedHits + ' 篇相关文档因超过复核周期正在保鲜复核，暂未引用')
+    if (gatePausedHits) extraNotes.push(gatePausedHits + ' 篇相关文档正在发布门禁（变更影响评估）中，暂未引用')
     if (retiredHitCount) extraNotes.push(retiredHitCount + ' 篇相关文档已知识退役，已转由替代文档承接')
     answer.value = '基于知识库检索，我找到与「' + asked.value + '」相关的内容，引用来源如下。' + (citableHits.length > 1 ? ' 我对其归纳后优先展示最相关的 ' + Math.min(citableHits.length, 3) + ' 篇文档。' : '') + (extraNotes.length ? '（' + extraNotes.join('；') + '）' : '')
     rawCites.value = citableHits.slice(0, 3).map((h) => ({
@@ -256,7 +280,7 @@ function answering() {
 function useSuggestion(s) { question.value = s; ask(s) }
 
 watch(() => route.query.q, (v) => { if (v) { question.value = v; ask(v) } }, { immediate: true })
-onMounted(() => { retirementStore.loadAll() })
+onMounted(() => { retirementStore.loadAll(); gateStore.loadAll() })
 </script>
 
 <template>
@@ -280,6 +304,7 @@ onMounted(() => { retirementStore.loadAll() })
       <p class="a-text">{{ answerText }}</p>
       <div v-if="revokedCount" class="revoked-note">
         <template v-if="freshnessPausedCount">🧊 {{ freshnessPausedCount }} 条引用因超过复核周期正在保鲜复核，问答引用已暂停，复核通过后自动恢复</template>
+        <template v-else-if="gatePausedCount">🚦 {{ gatePausedCount }} 条引用的文档正在发布门禁（变更影响评估）中，问答引用已暂停，负责人确认、管理员放行后恢复</template>
         <template v-else-if="retiredCount">🗄 {{ retiredCount }} 条引用的文档已知识退役，问答引用已停止<template v-if="retiredReplacements.length">，请改看替代文档：
           <span v-for="rep in retiredReplacements" :key="rep.id" class="rep-link" @click="router.push('/docs/' + rep.id)">《{{ rep.title }}》</span>
         </template></template>

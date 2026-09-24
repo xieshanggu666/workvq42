@@ -8,6 +8,7 @@ import { useAccessStore } from '@/stores/access'
 import { useFreshnessStore } from '@/stores/freshness'
 import { useCorrectionStore } from '@/stores/correction'
 import { useRetirementStore } from '@/stores/retirement'
+import { useGateStore } from '@/stores/gate'
 import RichEditor from '@/components/doc/RichEditor.vue'
 import { docVersion, fieldLabels } from '@/utils/version'
 import { canEditDoc, ROLE, GUEST_ID } from '@/utils/permission'
@@ -22,6 +23,7 @@ const accessStore = useAccessStore()
 const freshnessStore = useFreshnessStore()
 const correctionStore = useCorrectionStore()
 const retirementStore = useRetirementStore()
+const gateStore = useGateStore()
 
 const isEdit = computed(() => route.params.id && route.params.id !== 'new')
 const editingDoc = ref(null)
@@ -43,8 +45,9 @@ const savedToast = ref('')
 const saving = ref(false)
 // 提交模式：save 直接保存为新版本（原行为）；review 保存即发起评审，审批通过后才发布；
 // fresh 知识保鲜整改：修订后送当轮复核，管理员复核通过恢复引用并重算周期；
-// correction 知识纠错修订：修订后关联纠错单送审，管理员审批通过回写新版本并结案、问答引用指向新版
-const submitMode = ref(route.query.freshReview ? 'fresh' : route.query.correctionReview ? 'correction' : route.query.submitReview ? 'review' : 'save')
+// correction 知识纠错修订：修订后关联纠错单送审，管理员审批通过回写新版本并结案、问答引用指向新版；
+// gate 知识变更发布门禁：提交版本后冻结受影响的问答引用/缺口工单/共享链接，负责人确认影响、管理员审批放行后发布
+const submitMode = ref(route.query.freshReview ? 'fresh' : route.query.correctionReview ? 'correction' : route.query.submitGate ? 'gate' : route.query.submitReview ? 'review' : 'save')
 const reviewNote = ref('')
 // 知识保鲜当前流转复核单（fresh 模式下送审目标）
 const freshTicket = ref(null)
@@ -165,9 +168,30 @@ async function submit(force = false) {
         }
         return
       }
+      // 发布门禁：提交版本后冻结受影响项（问答引用/缺口工单/共享链接），负责人确认、管理员放行后才发布
+      if (submitMode.value === 'gate') {
+        const res = await gateStore.submitGate(route.params.id, payload, reviewNote.value.trim(), auth.user)
+        if (res.status === 'ok') {
+          dismissBackup()
+          localStorage.removeItem(draftKey)
+          router.push({ path: '/docs/' + route.params.id, query: { gateSubmitted: '1' } })
+        } else if (res.status === 'duplicate') {
+          alert('该文档已有流转中的发布门禁，请等待负责人确认、管理员审批后再提交。')
+        } else if (res.status === 'review-locked') {
+          alert('该文档正在评审中，请等待评审完结后再提交发布门禁。')
+        } else if (res.status === 'retired') {
+          alert('该文档已退役为只读归档，不能提交发布门禁。')
+        } else if (res.status === 'missing') {
+          alert('文档不存在或已被删除')
+        } else if (res.status === 'guest') {
+          alert('访客不能提交发布门禁，请先登录。')
+        } else {
+          alert('你没有该文档的提交权限：仅拥有者、协作成员或管理员可提交发布门禁。')
+        }
+        return
+      }
       // 评审模式：不直接写正文，而是把当前编辑内容作为快照发起评审，通过后才发布
-      if (submitMode.value === 'review') {
-        const res = await reviewStore.submitReview(route.params.id, payload, reviewNote.value.trim(), auth.user)
+      if (submitMode.value === 'review') {        const res = await reviewStore.submitReview(route.params.id, payload, reviewNote.value.trim(), auth.user)
         if (res.status === 'ok') {
           dismissBackup()
           localStorage.removeItem(draftKey)
@@ -188,6 +212,7 @@ async function submit(force = false) {
       if (res.status === 'guest') { alert('访客不能编辑文档，请通过有效的可编辑共享链接访问或登录。'); return }
       if (res.status === 'access-denied') { alert('你没有该文档的编辑权限：限时协作授权已被撤销或到期，编辑权限已收回。'); await load(); return }
       if (res.status === 'review-locked') { alert('该文档正在评审中，审批完成前无法保存修改。'); await load(); return }
+      if (res.status === 'gate-locked') { alert('该文档正在发布门禁（变更影响评估）中，门禁放行/回退前无法保存修改。'); await load(); return }
       if (res.status === 'conflict') {
         // 保留未提交内容：内容留在编辑器中，同时写入备份
         conflict.value = res
@@ -246,6 +271,12 @@ async function load() {
     const active = reviewStore.pendingReviewOf(route.params.id)
     activeReview.value = active
     lockedByReview.value = !!active && auth.user?.role !== ROLE.ADMIN
+    // 发布门禁：取当前流转门禁，gate 模式失效（已在门禁中）时回退直接保存模式
+    await gateStore.loadAll()
+    const activeGate = d ? gateStore.openGateOf(d.id) : null
+    if (route.query.submitGate && activeGate) {
+      submitMode.value = 'save'
+    }
     // 知识保鲜：取当前流转复核单，fresh 模式失效（已送审/无单）时回退直接保存模式
     await freshnessStore.loadAll()
     freshTicket.value = d ? freshnessStore.activeTicketOf(d.id) : null
@@ -262,12 +293,13 @@ async function load() {
       submitMode.value = 'save'
     }
     // 编辑权限：拥有者/固定协作成员/持有效限时协作授权；授权撤销或到期后进入即被收回；
-    // 已退役文档为只读归档，任何身份都不可再编辑（需先撤销退役）
+    // 已退役文档为只读归档，任何身份都不可再编辑（需先撤销退役）；评审/门禁流转中同样锁定
     await retirementStore.loadAll()
     const activeRetirement = d ? retirementStore.activeRetirementOfDoc(d.id) : null
     activeGrant.value = d ? accessStore.grantOf(d.id, auth.user?.id) : null
+    if (activeGate && auth.user?.role !== ROLE.ADMIN) lockedByReview.value = true
     accessDenied.value = d
-      ? !canEditDoc(d, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, grant: activeGrant.value, pendingReview: active, activeRetirement })
+      ? !canEditDoc(d, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, grant: activeGrant.value, pendingReview: active, activeGate, activeRetirement })
       : false
     // 限时协作授权的只读成员没有「发起评审」通道，强制直接保存模式
     if (activeGrant.value && auth.user?.role !== ROLE.ADMIN && auth.user?.role !== ROLE.EDITOR) {
@@ -327,16 +359,17 @@ const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)
       <span class="toast">{{ savedToast }}</span>
       <div class="spacer"></div>
       <template v-if="isEdit && !lockedByReview && !accessDenied">
-        <div class="mode-seg" v-if="!isGrantOnly" title="直接保存立即生效；发起评审/保鲜复核/纠错修订则由管理员审批通过后发布">
+        <div class="mode-seg" v-if="!isGrantOnly" title="直接保存立即生效；发起评审/保鲜复核/纠错修订/发布门禁则由管理员审批通过后发布">
           <button :class="{ on: submitMode === 'save' }" @click="submitMode = 'save'">直接保存</button>
           <button :class="{ on: submitMode === 'review' }" @click="submitMode = 'review'">发起评审</button>
           <button v-if="freshTicket && freshTicket.status !== 'submitted'" :class="{ on: submitMode === 'fresh' }" @click="submitMode = 'fresh'">🧊 保鲜整改</button>
           <button v-if="correctionTicket && correctionTicket.status === 'claimed'" :class="{ on: submitMode === 'correction' }" @click="submitMode = 'correction'">🐞 纠错修订</button>
+          <button :class="{ on: submitMode === 'gate' }" @click="submitMode = 'gate'">🚦 发布门禁</button>
         </div>
         <span v-else class="grant-hint" title="限时协作授权：可直接编辑保存，审批发布由文档编辑者发起">🔑 限时协作授权中</span>
         <button class="btn" @click="manualSave">保存草稿</button>
         <button class="btn primary" :disabled="!canPublish || saving" @click="submit()">
-          {{ saving ? '提交中…' : (submitMode === 'fresh' ? '提交保鲜复核' : submitMode === 'correction' ? '提交纠错修订' : submitMode === 'review' ? '提交评审' : isEdit ? '保存变更' : '发布文档') }}
+          {{ saving ? '提交中…' : (submitMode === 'fresh' ? '提交保鲜复核' : submitMode === 'correction' ? '提交纠错修订' : submitMode === 'gate' ? '提交版本走门禁' : submitMode === 'review' ? '提交评审' : isEdit ? '保存变更' : '发布文档') }}
         </button>
       </template>
     </div>
@@ -414,11 +447,12 @@ const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)
         </div>
       </div>
 
-      <div v-if="isEdit && (submitMode === 'review' || submitMode === 'fresh' || submitMode === 'correction') && !lockedByReview && !isGrantOnly" class="field">
-        <label class="rv-label">{{ submitMode === 'fresh' ? '保鲜复核说明' : submitMode === 'correction' ? '纠错修订说明' : '评审说明' }}</label>
-        <textarea v-model="reviewNote" rows="2" :placeholder="submitMode === 'fresh' ? '向管理员说明本次保鲜修订要点（会作为复核意见留痕，可选）' : submitMode === 'correction' ? '向管理员说明本次纠错修订要点，如修正了哪些错误内容（会作为首条评审意见留痕，可选）' : '向管理员说明本次修改要点（会作为首条评审意见留痕，可选）'"></textarea>
+      <div v-if="isEdit && (submitMode === 'review' || submitMode === 'fresh' || submitMode === 'correction' || submitMode === 'gate') && !lockedByReview && !isGrantOnly" class="field">
+        <label class="rv-label">{{ submitMode === 'fresh' ? '保鲜复核说明' : submitMode === 'correction' ? '纠错修订说明' : submitMode === 'gate' ? '变更说明' : '评审说明' }}</label>
+        <textarea v-model="reviewNote" rows="2" :placeholder="submitMode === 'fresh' ? '向管理员说明本次保鲜修订要点（会作为复核意见留痕，可选）' : submitMode === 'correction' ? '向管理员说明本次纠错修订要点，如修正了哪些错误内容（会作为首条评审意见留痕，可选）' : submitMode === 'gate' ? '说明本次知识变更要点，供负责人评估影响（会随门禁单留痕，可选）' : '向管理员说明本次修改要点（会作为首条评审意见留痕，可选）'"></textarea>
         <div class="rv-hint" v-if="submitMode === 'fresh'">提交后进入「保鲜复核中」并锁定正文，管理员复核通过后修订生效、问答引用恢复并按周期重新计时；驳回则继续整改。</div>
         <div class="rv-hint" v-else-if="submitMode === 'correction'">提交后纠错单进入「送审中」并锁定正文，管理员审批通过后修订回写为新版本、纠错单结案并通知提交人，问答引用随即指向修订内容；驳回则退回继续修订。</div>
+        <div class="rv-hint gate-hint" v-else-if="submitMode === 'gate'">提交后建立发布门禁：自动关联受影响的问答引用、缺口工单与共享链接并暂停引用/挂起链接、锁定正文；负责人确认影响后由管理员审批放行（发布版本、恢复引用与链接）或回退。</div>
         <div class="rv-hint" v-else>提交后文档进入「评审中」并锁定当前正文，审批通过后以上内容与可见性才会生效。</div>
       </div>
     </div>
@@ -463,6 +497,7 @@ const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)
 .field textarea { width: 100%; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 10px; font-size: 13px; resize: vertical; outline: none; }
 .field textarea:focus { border-color: var(--primary); }
 .rv-hint { font-size: 12px; color: var(--warn); }
+.rv-hint.gate-hint { color: #4338ca; }
 .lock-bar { padding: 16px 22px; margin-bottom: 14px; border-color: #f59e0b; background: #fffbeb; }
 .lock-head { font-weight: 600; color: #b45309; margin-bottom: 6px; }
 .lock-desc { font-size: 13px; color: var(--text-2); margin-bottom: 10px; }
