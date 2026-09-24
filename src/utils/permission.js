@@ -15,6 +15,13 @@ export function isGuestUser(userId) {
   return !userId || userId === GUEST_ID
 }
 
+// 文档是否处于发布门禁中（存在待确认/待审批门禁）。门禁语义与评审锁定一致：
+// 候选版本尚未放行，对外仍为已发布旧版，非管理员一律不可写入（本地判定，避免与 release 模块循环依赖）
+export function isDocReleaseGated(doc, openGate) {
+  if (openGate) return true
+  return !!doc?.release?.activeGateId && doc.release.state === 'gated'
+}
+
 // 可新增/编辑/删除的（内容治理角色）
 export function canEditContent(role) {
   return role === ROLE.ADMIN || role === ROLE.EDITOR
@@ -34,9 +41,9 @@ export function canEditDoc(doc, ctx = {}) {
   // 已退役文档为只读归档：任何身份（含管理员、共享链接、限时授权）均不可再改正文，
   // 如需修改须先撤销退役（恢复搜索/引用）后再编辑
   if (isDocRetired(doc, ctx.activeRetirement)) return false
-  const locked = isDocInReview(doc, ctx.pendingReview)
+  const locked = isDocInReview(doc, ctx.pendingReview) || isDocReleaseGated(doc, ctx.openGate)
   if (isGuestUser(ctx.userId)) {
-    // 评审锁定对访客同样生效，不允许借共享链接在锁定期写入
+    // 评审锁定/发布门禁对访客同样生效，不允许借共享链接在锁定期写入
     return !locked && canShareEdit(ctx.share, ctx.now)
   }
   if (locked && ctx.role !== ROLE.ADMIN) return false
@@ -57,6 +64,8 @@ export function canDeleteDoc(doc, ctx = {}) {
   // 已退役文档保留作历史归档与替代跳转，不允许删除；需删除先撤销退役
   if (isDocRetired(doc, ctx.activeRetirement)) return false
   if (isDocInReview(doc, ctx.pendingReview) && ctx.role !== ROLE.ADMIN) return false
+  // 发布门禁流转中：候选版本尚未放行，先撤回/走完门禁再删除
+  if (isDocReleaseGated(doc, ctx.openGate) && ctx.role !== ROLE.ADMIN) return false
   if (doc.ownerId === ctx.userId) return true
   if (Array.isArray(doc.editors) && doc.editors.includes(ctx.userId)) return true
   return ctx.role === ROLE.ADMIN

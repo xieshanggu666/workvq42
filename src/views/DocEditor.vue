@@ -8,6 +8,7 @@ import { useAccessStore } from '@/stores/access'
 import { useFreshnessStore } from '@/stores/freshness'
 import { useCorrectionStore } from '@/stores/correction'
 import { useRetirementStore } from '@/stores/retirement'
+import { useReleaseStore } from '@/stores/release'
 import RichEditor from '@/components/doc/RichEditor.vue'
 import { docVersion, fieldLabels } from '@/utils/version'
 import { canEditDoc, ROLE, GUEST_ID } from '@/utils/permission'
@@ -22,6 +23,7 @@ const accessStore = useAccessStore()
 const freshnessStore = useFreshnessStore()
 const correctionStore = useCorrectionStore()
 const retirementStore = useRetirementStore()
+const releaseStore = useReleaseStore()
 
 const isEdit = computed(() => route.params.id && route.params.id !== 'new')
 const editingDoc = ref(null)
@@ -51,6 +53,9 @@ const freshTicket = ref(null)
 // 文档当前是否处于评审中（非管理员进入时只读锁定）
 const lockedByReview = ref(false)
 const activeReview = ref(null)
+// 文档当前是否处于发布门禁中（待负责人确认/待管理员审批，非管理员只读锁定）
+const lockedByGate = ref(false)
+const activeGate = ref(null)
 // 无编辑权限（非拥有者/协作成员，且无有效限时协作授权，或授权已撤销/到期）
 const accessDenied = ref(false)
 // 当前用户的有效限时授权（限时协作成员可编辑，但不能发起评审）
@@ -188,6 +193,7 @@ async function submit(force = false) {
       if (res.status === 'guest') { alert('访客不能编辑文档，请通过有效的可编辑共享链接访问或登录。'); return }
       if (res.status === 'access-denied') { alert('你没有该文档的编辑权限：限时协作授权已被撤销或到期，编辑权限已收回。'); await load(); return }
       if (res.status === 'review-locked') { alert('该文档正在评审中，审批完成前无法保存修改。'); await load(); return }
+      if (res.status === 'gate-locked') { alert('该文档正在发布门禁中，候选版本放行前无法保存修改。'); await load(); return }
       if (res.status === 'conflict') {
         // 保留未提交内容：内容留在编辑器中，同时写入备份
         conflict.value = res
@@ -265,9 +271,12 @@ async function load() {
     // 已退役文档为只读归档，任何身份都不可再编辑（需先撤销退役）
     await retirementStore.loadAll()
     const activeRetirement = d ? retirementStore.activeRetirementOfDoc(d.id) : null
+    await releaseStore.loadAll()
+    activeGate.value = d ? releaseStore.openGateOfDoc(d.id) : null
+    lockedByGate.value = !!activeGate.value && auth.user?.role !== ROLE.ADMIN
     activeGrant.value = d ? accessStore.grantOf(d.id, auth.user?.id) : null
     accessDenied.value = d
-      ? !canEditDoc(d, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, grant: activeGrant.value, pendingReview: active, activeRetirement })
+      ? !canEditDoc(d, { userId: auth.user?.id || GUEST_ID, role: auth.user?.role, grant: activeGrant.value, pendingReview: active, activeRetirement, openGate: activeGate.value })
       : false
     // 限时协作授权的只读成员没有「发起评审」通道，强制直接保存模式
     if (activeGrant.value && auth.user?.role !== ROLE.ADMIN && auth.user?.role !== ROLE.EDITOR) {
@@ -315,8 +324,8 @@ const isGrantOnly = computed(() => {
   if (auth.user?.role === ROLE.ADMIN || auth.user?.role === ROLE.EDITOR) return false
   return editingDoc.value.ownerId !== auth.user?.id && !(editingDoc.value.editors || []).includes(auth.user?.id)
 })
-// 可编辑：未被评审锁定、未被授权收回
-const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)
+// 可编辑：未被评审锁定、未被发布门禁锁定、未被授权收回
+const editableNow = computed(() => !lockedByReview.value && !lockedByGate.value && !accessDenied.value)
 </script>
 
 <template>
@@ -326,7 +335,7 @@ const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)
       <span class="mode-badge">{{ isEdit ? '编辑文档' : '新建文档' }}</span>
       <span class="toast">{{ savedToast }}</span>
       <div class="spacer"></div>
-      <template v-if="isEdit && !lockedByReview && !accessDenied">
+      <template v-if="isEdit && !lockedByReview && !lockedByGate && !accessDenied">
         <div class="mode-seg" v-if="!isGrantOnly" title="直接保存立即生效；发起评审/保鲜复核/纠错修订则由管理员审批通过后发布">
           <button :class="{ on: submitMode === 'save' }" @click="submitMode = 'save'">直接保存</button>
           <button :class="{ on: submitMode === 'review' }" @click="submitMode = 'review'">发起评审</button>
@@ -363,6 +372,18 @@ const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)
       </div>
     </div>
 
+    <div v-if="lockedByGate" class="card gate-lock-bar">
+      <div class="gate-lock-head">🚦 新版本发布门禁中，暂不可编辑</div>
+      <div class="lock-desc">
+        v{{ activeGate?.version }} 已由 {{ activeGate ? userById[activeGate.submittedBy] : '' }} 提交发布门禁，
+        当前{{ activeGate?.status === 'pending_confirm' ? '等待文档负责人确认影响' : '等待管理员审批放行' }}；
+        放行后新版本才对外发布，驳回或撤回则保持当前已发布版本。
+      </div>
+      <div class="lock-actions">
+        <button class="btn sm primary" @click="router.push('/docs/' + route.params.id)">查看门禁详情</button>
+      </div>
+    </div>
+
     <div v-if="conflict" class="card conflict-bar">
       <div class="c-head">⚠️ 保存冲突：这篇文档已在其他窗口被修改并保存</div>
       <div class="c-desc">
@@ -384,7 +405,7 @@ const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)
       </div>
     </div>
 
-    <div class="form card" :class="{ locked: lockedByReview || accessDenied }">
+    <div class="form card" :class="{ locked: lockedByReview || lockedByGate || accessDenied }">
       <div class="field title-field">
         <input class="big-title" v-model="title" placeholder="文档标题…" maxlength="80" />
       </div>
@@ -423,8 +444,8 @@ const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)
       </div>
     </div>
 
-    <div class="card editor-wrap" :class="{ locked: lockedByReview || accessDenied }">
-      <RichEditor v-model="body" :disabled="lockedByReview || accessDenied" @stats="stats = $event" />
+    <div class="card editor-wrap" :class="{ locked: lockedByReview || lockedByGate || accessDenied }">
+      <RichEditor v-model="body" :disabled="lockedByReview || lockedByGate || accessDenied" @stats="stats = $event" />
     </div>
     <div class="statline">正文 {{ stats.chars }} 字 · {{ stats.words }} 词 · 图片 {{ stats.imgs }} 张</div>
   </div>
@@ -465,6 +486,8 @@ const editableNow = computed(() => !lockedByReview.value && !accessDenied.value)
 .rv-hint { font-size: 12px; color: var(--warn); }
 .lock-bar { padding: 16px 22px; margin-bottom: 14px; border-color: #f59e0b; background: #fffbeb; }
 .lock-head { font-weight: 600; color: #b45309; margin-bottom: 6px; }
+.gate-lock-bar { padding: 16px 22px; margin-bottom: 14px; border-color: #60a5fa; background: #eff6ff; }
+.gate-lock-head { font-weight: 600; color: #1d4ed8; margin-bottom: 6px; }
 .lock-desc { font-size: 13px; color: var(--text-2); margin-bottom: 10px; }
 .lock-actions { display: flex; gap: 8px; }
 .deny-bar { border-color: var(--danger); background: #fff5f5; margin-bottom: 14px; }

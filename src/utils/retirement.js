@@ -267,6 +267,7 @@ export function retireRowErrorLabel(error, row) {
     case 'replacement-retired': return '替代文档已退役或在退役流程中'
     case 'used-as-replacement': return '本文档正作为' + (row?.usedByTitle ? '《' + row.usedByTitle + '》' : '另一篇文档') + '的替代文档，需先处理该退役'
     case 'in-review': return '文档评审中，请待评审完结'
+    case 'in-gate': return '文档发布门禁中，请先撤回或走完门禁'
     case 'in-handover': return '文档责任交接中，请先完成或取消交接'
     case 'replacement-in-batch': return '替代文档《' + (row?.replacementTitle || '') + '》也在本批退役中，会形成替代链冲突'
     default: return ''

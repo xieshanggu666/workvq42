@@ -83,6 +83,8 @@ async function submit() {
       alert('文档正在评审中，请待评审完结后再发起退役。')
     } else if (res.status === 'in-handover') {
       alert('文档正在责任交接中，请先完成或取消交接。')
+    } else if (res.status === 'in-gate') {
+      alert('文档正在发布门禁中，请先撤回或走完发布门禁后再发起退役。')
     } else if (res.status === 'replacement-retired') {
       alert('替代文档已退役或正在退役流程中，请选择其他文档。')
     } else if (res.status === 'used-as-replacement') {

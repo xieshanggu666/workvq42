@@ -7,9 +7,11 @@ import { useReviewStore } from '@/stores/review'
 import { useAccessStore } from '@/stores/access'
 import { useFreshnessStore } from '@/stores/freshness'
 import { useRetirementStore } from '@/stores/retirement'
+import { useReleaseStore } from '@/stores/release'
 import { canViewDoc } from '@/utils/permission'
 import { isFreshTicketOpen } from '@/utils/freshness'
 import { isDocSearchable } from '@/utils/retirement'
+import { publishedSnapshot } from '@/utils/release'
 import { tokenize, stripHtml, highlightTitle, highlightText, extractSnippet } from '@/utils/search'
 import { formatDate } from '@/utils/format'
 
@@ -21,6 +23,7 @@ const reviewStore = useReviewStore()
 const accessStore = useAccessStore()
 const freshnessStore = useFreshnessStore()
 const retirementStore = useRetirementStore()
+const releaseStore = useReleaseStore()
 
 const q = ref(route.query.q || '')
 const catFilter = ref('all')
@@ -43,31 +46,41 @@ const results = computed(() => {
     isDocSearchable(d, retirementStore.activeRetirementOfDoc(d.id))
   )
   const textById = {}
+  const snapById = {}
   list = list.map((d) => {
-    const text = stripHtml(d.body)
+    // 发布门禁中的文档只检索已发布旧版内容（候选版本未放行，不提前泄露）
+    const snap = publishedSnapshot(d, releaseStore.openGateOfDoc(d.id))
+    snapById[d.id] = snap
+    const text = stripHtml(snap.body)
     textById[d.id] = text
     return d
   }).filter((d) => {
-    const tagNames = (d.tagIds || []).map((id) => kb.tagMap[id]?.name || '')
-    const hay = (d.title + ' ' + textById[d.id] + ' ' + tagNames.join(' ')).toLowerCase()
+    const snap = snapById[d.id]
+    const tagIds = snap.tagIds || d.tagIds || []
+    const tagNames = tagIds.map((id) => kb.tagMap[id]?.name || '')
+    const hay = (snap.title + ' ' + textById[d.id] + ' ' + tagNames.join(' ')).toLowerCase()
     return kw.every((t) => hay.includes(t.toLowerCase()))
   })
 
-  if (catFilter.value !== 'all') list = list.filter((d) => d.categoryId === catFilter.value)
-  if (tagFilter.value !== 'all') list = list.filter((d) => (d.tagIds || []).includes(tagFilter.value))
+  if (catFilter.value !== 'all') list = list.filter((d) => (snapById[d.id].categoryId ?? d.categoryId) === catFilter.value)
+  if (tagFilter.value !== 'all') list = list.filter((d) => (snapById[d.id].tagIds || d.tagIds || []).includes(tagFilter.value))
 
-  return list.map((d) => ({
-    ...d,
-    bodyText: textById[d.id],
-    snippet: extractSnippet(d.body, kw)
-  }))
+  return list.map((d) => {
+    const snap = snapById[d.id]
+    return {
+      ...d,
+      searchTitle: snap.title || d.title,
+      bodyText: textById[d.id],
+      snippet: extractSnippet(snap.body, kw)
+    }
+  })
 })
 
 function clearAll() { q.value = ''; catFilter.value = 'all'; tagFilter.value = 'all'; router.push({ name: 'search' }) }
 
 watch(() => route.query.q, run, { immediate: true })
 
-onMounted(() => { retirementStore.loadAll() })
+onMounted(() => { retirementStore.loadAll(); releaseStore.loadAll() })
 </script>
 
 <template>
@@ -94,14 +107,15 @@ onMounted(() => { retirementStore.loadAll() })
     <div v-if="results.length" class="results">
       <div v-for="d in results" :key="d.id" class="result card" @click="router.push('/docs/' + d.id)">
         <div class="r-title-line">
-          <span class="r-title" v-html="highlightTitle(d.title, tokenize(q))"></span>
+          <span class="r-title" v-html="highlightTitle(d.searchTitle, tokenize(q))"></span>
           <span v-if="reviewStore.pendingReviewOf(d.id)" class="rv-badge">⏳ 评审中</span>
+          <span v-if="releaseStore.openGateOfDoc(d.id)" class="gate-badge" title="新版本待发布门禁放行，搜索结果展示已发布版">🚦 发布门禁中</span>
           <span v-if="isFreshTicketOpen(freshnessStore.activeTicketOf(d.id))" class="fresh-badge" title="超过复核周期，问答引用已暂停，复核通过后恢复">🧊 保鲜复核中</span>
         </div>
         <div class="r-cat">{{ kb.catMap[d.categoryId]?.name }} · 更新于 {{ formatDate(d.updatedAt) }}</div>
         <div class="r-snippet" v-html="highlightText(d.snippet, tokenize(q))"></div>
         <div class="r-tags">
-          <span v-for="t in d.tagIds" :key="t" class="pill tag" :style="{ background: kb.tagMap[t]?.color, color: '#fff' }">{{ kb.tagMap[t]?.name }}</span>
+          <span v-for="t in (d.tagIds || [])" :key="t" class="pill tag" :style="{ background: kb.tagMap[t]?.color, color: '#fff' }">{{ kb.tagMap[t]?.name }}</span>
         </div>
       </div>
     </div>
@@ -127,6 +141,7 @@ onMounted(() => { retirementStore.loadAll() })
 .r-title-line { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
 .r-title-line .r-title { margin-bottom: 0; }
 .rv-badge { font-size: 11px; background: #fef3c7; color: #b45309; border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
+.gate-badge { font-size: 11px; background: #dbeafe; color: #1d4ed8; border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
 .fresh-badge { font-size: 11px; background: #cffafe; color: #0e7490; border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
 .r-cat { color: var(--text-3); font-size: 12px; margin-bottom: 6px; }
 .r-snippet { color: var(--text-2); font-size: 13px; margin-bottom: 10px; }

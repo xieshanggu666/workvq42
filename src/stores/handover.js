@@ -117,7 +117,7 @@ export const useHandoverStore = defineStore('handover', () => {
     const nowIso = new Date().toISOString()
     let result = { status: 'error' }
 
-    await db.transaction('rw', db.docs, db.handovers, db.retirements, async () => {
+    await db.transaction('rw', db.docs, db.handovers, db.retirements, db.releaseGates, async () => {
       const hoItems = []
       for (const p of pairs) {
         // 事务内重读：归属与交接占用以库中最新数据为准，防止多窗口并发发起
@@ -128,6 +128,11 @@ export const useHandoverStore = defineStore('handover', () => {
         if (isDocRetired(doc)) { result = { status: 'retired', docId: p.docId, title: doc.title }; return }
         const dupRetire = await db.retirements.filter((rt) => rt.docId === p.docId && rt.status === 'pending').first()
         if (dupRetire) { result = { status: 'in-retirement', docId: p.docId, title: doc.title }; return }
+        // 发布门禁流转中：负责人尚未确认/版本尚未放行，先撤回或走完门禁再交接责任
+        const gateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
+        if (gateRec && (gateRec.status === 'pending_confirm' || gateRec.status === 'pending_approval')) {
+          result = { status: 'in-gate', docId: p.docId, title: doc.title }; return
+        }
         const dup = await db.handovers
           .filter((h) => (h.items || []).some((i) => i.docId === p.docId && isItemOpen(i))).first()
         if (dup) { result = { status: 'in-handover', docId: p.docId, title: doc.title, handover: dup }; return }

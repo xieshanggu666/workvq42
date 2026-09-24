@@ -124,6 +124,8 @@ async function submitInitiate() {
       alert('发起失败：《' + (res.title || res.docId) + '》已退役，不再参与责任交接。')
     } else if (res.status === 'in-retirement') {
       alert('发起失败：《' + (res.title || res.docId) + '》有流转中的退役申请，请先完成或取消。')
+    } else if (res.status === 'in-gate') {
+      alert('发起失败：《' + (res.title || res.docId) + '》正在发布门禁中，请先撤回或走完门禁再交接。')
     } else if (res.status === 'bad-target') {
       alert('发起失败：存在未指定或无效的接任者。')
     } else if (res.status === 'guest') {

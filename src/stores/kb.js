@@ -92,7 +92,7 @@ export const useKbStore = defineStore('kb', () => {
     const isGuest = savedBy === GUEST_ID
     let result = null
     // 读 + 写放在同一事务中，保证「权限/版本检测 → 合并 → 追加版本记录」不被其他窗口的写入打断
-    await db.transaction('rw', db.docs, db.accessRequests, db.shares, db.reviews, db.freshnessTickets, db.freshnessPolicies, async () => {
+    await db.transaction('rw', db.docs, db.accessRequests, db.shares, db.reviews, db.freshnessTickets, db.freshnessPolicies, db.releaseGates, async () => {
       const existing = await db.docs.get(id)
       if (!existing) { result = { status: 'missing' }; return }
       // 事务内重读评审状态：评审中锁定仅管理员可直接写（管理员并发修改通道），
@@ -100,6 +100,11 @@ export const useKbStore = defineStore('kb', () => {
       const pendingReview = await db.reviews
         .where('docId').equals(id)
         .filter((rv) => rv.status === 'pending').first()
+      // 发布门禁中锁定：待负责人确认/待管理员审批期间候选版本不对外，非管理员不可再写
+      const openGate = existing.release?.activeGateId
+        ? await db.releaseGates.get(existing.release.activeGateId)
+        : null
+      const gateLocked = openGate && (openGate.status === 'pending_confirm' || openGate.status === 'pending_approval') ? openGate : null
       // 限时协作授权：以库中最新申请记录判定，撤销/到期保存时立即收回
       let grant = null
       if (!isGuest) {
@@ -119,11 +124,14 @@ export const useKbStore = defineStore('kb', () => {
         role: currentUser?.role,
         grant,
         share,
-        pendingReview
+        pendingReview,
+        openGate: gateLocked
       })) {
-        // 拒绝原因区分优先级：评审锁定（含访客借链接写入）→ 访客无凭证 → 其余无资格
+        // 拒绝原因区分优先级：评审锁定（含访客借链接写入）→ 发布门禁锁定 → 访客无凭证 → 其余无资格
         if (pendingReview && currentUser?.role !== 'admin') {
           result = { status: 'review-locked', latest: existing }
+        } else if (gateLocked && currentUser?.role !== 'admin') {
+          result = { status: 'gate-locked', latest: existing }
         } else if (isGuest) {
           result = { status: 'guest', latest: existing }
         } else {
@@ -192,12 +200,15 @@ export const useKbStore = defineStore('kb', () => {
   async function deleteDoc(id, currentUser) {
     const userId = currentUser?.id || GUEST_ID
     let result = { status: 'ok' }
-    await db.transaction('rw', db.docs, db.comments, db.shares, db.reviews, db.accessRequests, db.gapTickets, db.freshnessTickets, db.retirements, db.correctionTickets, async () => {
+    await db.transaction('rw', db.docs, db.comments, db.shares, db.reviews, db.accessRequests, db.gapTickets, db.freshnessTickets, db.retirements, db.correctionTickets, db.releaseGates, db.qaCitations, async () => {
       const doc = await db.docs.get(id)
       if (!doc) { result = { status: 'missing' }; return }
       const pendingReview = await db.reviews
         .where('docId').equals(id)
         .filter((rv) => rv.status === 'pending').first()
+      // 发布门禁流转中：候选版本尚未放行，先撤回/走完门禁再删除
+      const openGate = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
+      const gateLocked = openGate && (openGate.status === 'pending_confirm' || openGate.status === 'pending_approval') ? openGate : null
       // 知识退役：已退役文档为只读归档不可删除；流转中退役单/作为他人替代文档的也先处理退役再删除，
       // 避免产生悬挂退役记录或让生效退役失去替代目标
       const activeRetirement = doc.retirement?.status === 'approved' ? doc.retirement : null
@@ -205,10 +216,12 @@ export const useKbStore = defineStore('kb', () => {
       // 作为他人退役替代文档：生效单必须先撤销退役，在途单必须先完成/取消，避免替代链断裂
       const usedAsReplacement = await db.retirements
         .filter((rt) => (rt.status === 'approved' || rt.status === 'pending') && rt.replacementDocId === id).first()
-      if (!canDeleteDoc(doc, { userId, role: currentUser?.role, pendingReview, activeRetirement })) {
+      if (!canDeleteDoc(doc, { userId, role: currentUser?.role, pendingReview, activeRetirement, openGate: gateLocked })) {
         result = { status: 'forbidden' }
         return
       }
+      // 非管理员：在途门禁/评审/退役先走完流程再删除；管理员可直接删除并在下方联动关闭门禁
+      if (gateLocked && currentUser?.role !== 'admin') { result = { status: 'in-gate' }; return }
       if (openRetirement) { result = { status: 'in-retirement' }; return }
       if (usedAsReplacement) { result = { status: 'is-replacement' }; return }
       await db.docs.delete(id)
@@ -220,6 +233,12 @@ export const useKbStore = defineStore('kb', () => {
       await db.accessRequests.where('docId').equals(id).delete()
       // 知识保鲜复核单随文档一并清理（复核周期与复核单失去依附对象）
       await db.freshnessTickets.where('docId').equals(id).delete()
+      // 问答引用记录随文档清理（发布门禁失去关联对象）
+      await db.qaCitations.where('docId').equals(id).delete()
+      // 发布门禁：在途单关闭（撤回态留痕），历史单保留但文档已不可见
+      const now0 = new Date().toISOString()
+      const { useReleaseStore } = await import('./release')
+      await useReleaseStore().resetGatesOfDocTx(id, now0)
       // 关联该文档的缺口工单退回处理中：答案来源/送审关联随文档删除失效，需重新关联
       const now = new Date().toISOString()
       const linkedTickets = await db.gapTickets.where('docId').equals(id).toArray()
@@ -241,9 +260,17 @@ export const useKbStore = defineStore('kb', () => {
     const gap = useGapStore()
     const { useFreshnessStore } = await import('./freshness')
     const { useCorrectionStore } = await import('./correction')
+    const { useReleaseStore } = await import('./release')
     const freshness = useFreshnessStore()
     const correction = useCorrectionStore()
-    await Promise.all([reloadDocs(), gap.reload(), freshness.loaded ? freshness.reload() : Promise.resolve(), correction.loaded ? correction.reload() : Promise.resolve()])
+    const releaseGate = useReleaseStore()
+    await Promise.all([
+      reloadDocs(),
+      gap.reload(),
+      freshness.loaded ? freshness.reload() : Promise.resolve(),
+      correction.loaded ? correction.reload() : Promise.resolve(),
+      releaseGate.loaded ? releaseGate.reload() : Promise.resolve()
+    ])
     return result
   }
 

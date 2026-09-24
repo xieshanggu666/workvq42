@@ -35,7 +35,7 @@ export const ITEM = {
 // 需要人工/外部解除后才能重试的业务冲突码（区别于可自动重试的瞬时错误）
 export const CONFLICT_CODES = new Set([
   'missing', 'doc-missing', 'replacement-missing', 'denied', 'guest',
-  'changed', 'closed', 'in-retirement', 'in-review', 'in-handover',
+  'changed', 'closed', 'in-retirement', 'in-review', 'in-handover', 'in-gate',
   'used-as-replacement', 'replacement-retired', 'bad-replacement',
   'replacement-in-batch', 'duplicate-doc'
 ])
@@ -190,6 +190,7 @@ export function orchestrationErrorLabel(code) {
     'in-retirement': '文档已退役或有在途退役单',
     'in-review': '文档评审中',
     'in-handover': '文档交接中',
+    'in-gate': '文档发布门禁中',
     'used-as-replacement': '本文档正被他单用作替代文档',
     'replacement-retired': '替代文档已退役/在退役中',
     'bad-replacement': '替代文档不合法',

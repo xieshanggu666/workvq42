@@ -8,10 +8,13 @@ import { useCorrectionStore } from '@/stores/correction'
 import { useAccessStore } from '@/stores/access'
 import { useFreshnessStore } from '@/stores/freshness'
 import { useRetirementStore } from '@/stores/retirement'
+import { useReleaseStore } from '@/stores/release'
 import { canViewDoc } from '@/utils/permission'
 import { isDocCitable } from '@/utils/freshness'
 import { isDocRetireCitable } from '@/utils/retirement'
+import { publishedSnapshot } from '@/utils/release'
 import { extractKeywords, scoreDoc } from '@/utils/qa'
+import { docVersion } from '@/utils/version'
 import { latestRestoreInfo } from '@/utils/version'
 import { gapStatusLabel } from '@/utils/gap'
 import { stripHtml, highlightText, highlightTitle, extractSnippet } from '@/utils/search'
@@ -26,6 +29,7 @@ const correctionStore = useCorrectionStore()
 const accessStore = useAccessStore()
 const freshnessStore = useFreshnessStore()
 const retirementStore = useRetirementStore()
+const releaseStore = useReleaseStore()
 
 const question = ref('')
 const asked = ref('')
@@ -45,6 +49,17 @@ const suggestions = ['Vue 如何初始化项目?', 'Dexie 怎么进行查询?', 
 function grantOf(d) { return accessStore.grantOf(d.id, auth.user?.id) }
 function freshTicketOf(d) { return freshnessStore.activeTicketOf(d.id) }
 function retirementOf(d) { return retirementStore.activeRetirementOfDoc(d.id) }
+// 发布门禁：文档处于门禁中时问答只检索/引用已发布旧版（候选版本不提前泄露）
+function gateOf(d) { return releaseStore.openGateOfDoc(d.id) }
+// 问答引用当前可见的内容快照（门禁中为已发布快照）与其版本号
+function citeSnapshotOf(d) {
+  const gate = gateOf(d)
+  const snap = publishedSnapshot(d, gate)
+  const version = gate
+    ? (gate.status === 'released' ? gate.version : gate.publishedVersion)
+    : docVersion(d)
+  return { ...snap, version, gateStatus: gate?.status || null }
+}
 const citableNow = (d) =>
   isDocCitable(d, freshTicketOf(d), freshnessStore.now) &&
   isDocRetireCitable(d, retirementOf(d))
@@ -60,6 +75,8 @@ const retiredCount = computed(() => rawCites.value.filter((c) =>
   isDocCitable(c, freshTicketOf(c), freshnessStore.now) &&
   !isDocRetireCitable(c, retirementOf(c))
 ).length)
+// 其中因发布门禁暂未放行、引用停留在旧发布版的篇数（候选版本通过门禁后自动切换）
+const gatedCount = computed(() => rawCites.value.filter((c) => !!c.citeGateStatus).length)
 // 被退役引用所指向的替代文档（提示用户转看新文档）
 // 替代文档本身也要过可见性校验：无权查看（含未登录访客）时不泄露标题
 const retiredReplacements = computed(() => {
@@ -195,7 +212,7 @@ function answering() {
   corFormDoc.value = null
   corSubmittedDocIds.value = new Set()
 
-  setTimeout(() => {
+  setTimeout(async () => {
     const keywords = extractKeywords(asked.value)
     const tagNames = kb.tags
     // 可见但处于知识保鲜暂停期（周期到点/复核中）的命中：不作为引用来源，仅记录篇数给出提示
@@ -206,16 +223,18 @@ function answering() {
     const hits = kb.docs
       .filter((d) => canViewDoc(d, auth.user?.id, null, grantOf(d)))
       .map((d) => {
-        const bodyText = stripHtml(d.body)
+        const pub = citeSnapshotOf(d)
+        const bodyText = stripHtml(pub.body)
         const freshOk = isDocCitable(d, freshTicketOf(d), freshnessStore.now)
         const retireOk = isDocRetireCitable(d, retirementOf(d))
         return {
           doc: d,
+          pub,
           bodyText,
           retired: !retireOk,
           citable: freshOk && retireOk,
           freshPaused: !freshOk,
-          score: scoreDoc(d, keywords, tagNames, bodyText)
+          score: scoreDoc({ ...d, title: pub.title, tagIds: pub.tagIds }, keywords, tagNames, bodyText)
         }
       })
       .filter((x) => x.score > 0)
@@ -243,11 +262,22 @@ function answering() {
     answer.value = '基于知识库检索，我找到与「' + asked.value + '」相关的内容，引用来源如下。' + (citableHits.length > 1 ? ' 我对其归纳后优先展示最相关的 ' + Math.min(citableHits.length, 3) + ' 篇文档。' : '') + (extraNotes.length ? '（' + extraNotes.join('；') + '）' : '')
     rawCites.value = citableHits.slice(0, 3).map((h) => ({
       ...h.doc,
+      citeTitle: h.pub.title,
+      citeBody: h.pub.body,
+      citeVersion: h.pub.version,
+      citeGateStatus: h.pub.gateStatus,
       bodyText: h.bodyText,
-      snippet: extractSnippet(h.doc.body, keywords),
+      snippet: extractSnippet(h.pub.body, keywords),
       score: h.score
     }))
     rawRelated.value = citableHits.slice(3, 7).map((h) => h.doc)
+    // 问答引用留档：作为后续发布门禁「受影响问答引用」的关联来源
+    await releaseStore.recordCitations({
+      question: asked.value,
+      keywords,
+      cites: rawCites.value,
+      askedBy: auth.user?.id
+    })
     thinking.value = false
     answered.value = true
   }, 600)
@@ -296,12 +326,17 @@ onMounted(() => { retirementStore.loadAll() })
         <div class="rs-hint">如替代文档无访问权限，打开后可直接向其拥有者申请限时阅读/协作权限。</div>
       </div>
 
+      <div v-if="gatedCount" class="gated-note">
+        🚦 {{ gatedCount }} 条引用的文档存在待放行的新版本（发布门禁中），当前引用为门禁前已发布版本；负责人确认影响、管理员审批放行后将自动切换到新版。
+      </div>
+
       <div v-if="cites.length" class="cites">
         <div class="block-title">📎 引用出处</div>
         <div v-for="c in cites" :key="c.id" class="cite">
           <div class="cite-head" @click="router.push('/docs/' + c.id)">
             <span class="cite-score" v-if="c.score >= 5">★ 高相关</span>
-            <span class="cite-title" v-html="highlightTitle(c.title, extractKeywords(asked))"></span>
+            <span class="cite-title" v-html="highlightTitle(c.citeTitle || c.title, extractKeywords(asked))"></span>
+            <span class="cite-ver" title="当前引用内容版本">v{{ c.citeVersion ?? '?' }}</span>
           </div>
           <div class="cite-snippet" @click="router.push('/docs/' + c.id)" v-html="highlightText(c.snippet, extractKeywords(asked))"></div>
           <div class="cite-meta">
@@ -393,6 +428,8 @@ onMounted(() => { retirementStore.loadAll() })
 .sub-ask { font-weight: 400; font-size: 12px; color: var(--text-3); }
 .a-text { margin: 8px 0 18px; color: var(--text); }
 .revoked-note { margin: -8px 0 14px; padding: 8px 14px; border-radius: 8px; font-size: 13px; color: #b45309; background: #fffbeb; border: 1px solid #f59e0b; }
+.gated-note { margin: 0 0 14px; padding: 8px 14px; border-radius: 8px; font-size: 13px; color: #1d4ed8; background: #eff6ff; border: 1px solid #60a5fa; }
+.cite-ver { font-size: 11px; color: var(--text-3); background: var(--panel-2); border-radius: 999px; padding: 0 8px; }
 .rep-link { color: var(--primary); font-weight: 600; cursor: pointer; margin: 0 4px; }
 .rep-link:hover { text-decoration: underline; }
 .retired-suggest { margin: 0 0 14px; padding: 12px 14px; border-radius: 10px; background: #f8fafc; border: 1px solid #cbd5e1; }

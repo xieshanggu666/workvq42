@@ -19,13 +19,16 @@ export const useShareStore = defineStore('share', () => {
     const now = new Date()
     const nowIso = now.toISOString()
     let result = { status: 'error' }
-    await db.transaction('rw', db.docs, db.shares, db.reviews, db.accessRequests, async () => {
+    await db.transaction('rw', db.docs, db.shares, db.reviews, db.accessRequests, db.releaseGates, async () => {
       const doc = await db.docs.get(docId)
       if (!doc) { result = { status: 'missing' }; return }
       // 事务内重读评审与限时授权：评审锁定/授权撤销后创建资格立即按最新状态判定
       const pendingReview = await db.reviews
         .where('docId').equals(docId)
         .filter((rv) => rv.status === 'pending').first()
+      // 发布门禁流转中：候选版本未放行，门禁锁定同样禁止再生成可编辑链接
+      const gateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
+      const openGate = gateRec && (gateRec.status === 'pending_confirm' || gateRec.status === 'pending_approval') ? gateRec : null
       const grantReqs = await db.accessRequests
         .where('docId').equals(docId)
         .filter((r) => r.applicantId === userId).toArray()
@@ -37,6 +40,7 @@ export const useShareStore = defineStore('share', () => {
         role: currentUser?.role,
         grant,
         pendingReview,
+        openGate,
         activeRetirement,
         now
       })) {

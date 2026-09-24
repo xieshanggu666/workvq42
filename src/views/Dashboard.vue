@@ -5,15 +5,23 @@ import { useKbStore } from '@/stores/kb'
 import { useAuthStore } from '@/stores/auth'
 import { useEngagementStore } from '@/stores/engagement'
 import { useAccessStore } from '@/stores/access'
+import { useReleaseStore } from '@/stores/release'
 import DocPill from '@/components/common/DocPill.vue'
 import { formatDate, avatarColor } from '@/utils/format'
 import { canEditContent, canViewDoc } from '@/utils/permission'
+import { publishedSnapshot } from '@/utils/release'
 
 const router = useRouter()
 const kb = useKbStore()
 const auth = useAuthStore()
 const engagement = useEngagementStore()
 const accessStore = useAccessStore()
+const releaseStore = useReleaseStore()
+releaseStore.loadAll()
+
+// 门禁中的文档标题按已发布版展示（候选版本不提前泄露）
+const titleOf = (d) => publishedSnapshot(d, releaseStore.openGateOfDoc(d.id)).title || d.title
+const isGated = (id) => !!releaseStore.openGateOfDoc(id)
 
 const docById = computed(() => Object.fromEntries(kb.docs.map((d) => [d.id, d])))
 // 仅保留当前用户可查看的文档（含有效限时授权；撤销/到期后从首页各列表收回）
@@ -60,7 +68,7 @@ const canEdit = computed(() => canEditContent(auth.user?.role))
         <div class="card list">
           <div v-for="d in latest" :key="d.id" class="row" @click="router.push('/docs/' + d.id)">
             <div class="row-main">
-              <span class="title">{{ d.title }}</span>
+              <span class="title">{{ titleOf(d) }}<em v-if="isGated(d.id)" class="gated-flag">🚦 门禁中</em></span>
               <DocPill :doc="d" />
             </div>
             <span class="time">{{ formatDate(d.updatedAt) }}</span>
@@ -73,7 +81,7 @@ const canEdit = computed(() => canEditContent(auth.user?.role))
         <div class="card list">
           <div v-for="d in collab" :key="d.id" class="row" @click="router.push('/docs/' + d.id)">
             <div class="row-main">
-              <span class="title">{{ d.title }}</span>
+              <span class="title">{{ titleOf(d) }}<em v-if="isGated(d.id)" class="gated-flag">🚦 门禁中</em></span>
               <span class="avatars">
                 <span v-for="ed in d.editors.slice(0, 4)" :key="ed" class="ava" :style="{ background: avatarColor(ed) }">{{ ed.slice(0, 1) }}</span>
                 <span class="count">×{{ d.editors.length }}</span>
@@ -89,7 +97,7 @@ const canEdit = computed(() => canEditContent(auth.user?.role))
         <div class="card list">
           <div v-if="!recents.length" class="empty"><div class="ico">🕘</div>浏览过的文档会显示在这里</div>
           <div v-for="d in recents" :key="d.id" class="row" @click="router.push('/docs/' + d.id)">
-            <div class="row-main"><span class="title">{{ d.title }}</span><DocPill :doc="d" /></div>
+            <div class="row-main"><span class="title">{{ titleOf(d) }}<em v-if="isGated(d.id)" class="gated-flag">🚦 门禁中</em></span><DocPill :doc="d" /></div>
             <span class="time">{{ formatDate(d.updatedAt) }}</span>
           </div>
         </div>
@@ -128,6 +136,7 @@ const canEdit = computed(() => canEditContent(auth.user?.role))
 .row:hover { background: var(--panel-2); }
 .row-main { min-width: 0; }
 .title { font-weight: 600; font-size: 14px; display: block; margin-bottom: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 320px; }
+.gated-flag { font-style: normal; font-size: 10px; color: #1d4ed8; background: #dbeafe; border-radius: 999px; padding: 0 7px; margin-left: 6px; vertical-align: middle; }
 .time { color: var(--text-3); font-size: 12px; white-space: nowrap; }
 .avatars { display: flex; align-items: center; margin-top: 4px; }
 .ava { width: 22px; height: 22px; border-radius: 50%; color: #fff; font-size: 11px; display: grid; place-items: center; margin-left: -6px; border: 2px solid #fff; }

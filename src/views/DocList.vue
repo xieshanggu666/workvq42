@@ -5,9 +5,11 @@ import { useKbStore } from '@/stores/kb'
 import { useAuthStore } from '@/stores/auth'
 import { useAccessStore } from '@/stores/access'
 import { useRetirementStore } from '@/stores/retirement'
+import { useReleaseStore } from '@/stores/release'
 import DocPill from '@/components/common/DocPill.vue'
 import { formatDate, avatarColor } from '@/utils/format'
 import { canEditContent, canViewDoc, roleLabel } from '@/utils/permission'
+import { publishedSnapshot } from '@/utils/release'
 
 const route = useRoute()
 const router = useRouter()
@@ -15,7 +17,14 @@ const kb = useKbStore()
 const auth = useAuthStore()
 const accessStore = useAccessStore()
 const retirementStore = useRetirementStore()
+const releaseStore = useReleaseStore()
 retirementStore.loadAll()
+releaseStore.loadAll()
+
+// 门禁中的卡片只展示已发布版标题/正文（候选版本不提前泄露）
+function viewOf(d) {
+  return publishedSnapshot(d, releaseStore.openGateOfDoc(d.id))
+}
 
 const viewMode = ref('cards') // cards | list
 
@@ -62,10 +71,10 @@ function ownerName(id) { return kb.catMap[id]?.name }
     <p v-if="route.query.denied" class="notice">当前角色（{{ roleLabel(auth.user?.role) }}）无编辑权限，已切换为浏览模式。</p>
 
     <div v-if="filtered.length" class="cards" :class="viewMode">
-      <div v-for="d in filtered" :key="d.id" class="doc card" :class="{ retired: retirementStore.activeRetirementOfDoc(d.id) }" @click="router.push('/docs/' + d.id)">
-        <div class="doc-title">{{ d.title }}</div>
-        <div class="doc-body" v-html="d.body.slice(0, 300)"></div>
-        <div class="doc-pills"><DocPill :doc="d" /></div>
+      <div v-for="d in filtered" :key="d.id" class="doc card" :class="{ retired: retirementStore.activeRetirementOfDoc(d.id), gated: releaseStore.openGateOfDoc(d.id) }" @click="router.push('/docs/' + d.id)">
+        <div class="doc-title">{{ viewOf(d).title || d.title }}<span v-if="releaseStore.openGateOfDoc(d.id)" class="gate-flag" title="新版本发布门禁中，卡片展示已发布版">🚦 门禁中</span></div>
+        <div class="doc-body" v-html="viewOf(d).body.slice(0, 300)"></div>
+        <div class="doc-pills"><DocPill :doc="{ ...d, ...viewOf(d) }" /></div>
         <div class="doc-meta">
           <span class="authors">
             <span v-for="ed in d.editors.slice(0, 3)" :key="ed" class="ava" :style="{ background: avatarColor(ed) }">{{ ed.slice(0, 1) }}</span>
@@ -102,6 +111,8 @@ function ownerName(id) { return kb.catMap[id]?.name }
 .doc:hover { border-color: var(--primary); box-shadow: var(--shadow); }
 .doc.retired { opacity: 0.62; background: var(--panel-2); }
 .doc.retired:hover { border-color: #94a3b8; }
+.doc.gated { border-color: #93c5fd; }
+.gate-flag { margin-left: 8px; font-size: 11px; font-weight: 500; color: #1d4ed8; background: #dbeafe; border-radius: 999px; padding: 1px 8px; vertical-align: middle; }
 .doc-title { font-weight: 600; font-size: 15px; }
 .cards.list .doc-title { flex: 1; }
 .doc-body { color: var(--text-2); font-size: 13px; max-height: 56px; overflow: hidden; }

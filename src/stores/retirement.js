@@ -132,7 +132,7 @@ export const useRetirementStore = defineStore('retirement', () => {
     const nowIso = new Date().toISOString()
     let result = { status: 'error' }
 
-    await db.transaction('rw', db.docs, db.retirements, db.reviews, db.handovers, async () => {
+    await db.transaction('rw', db.docs, db.retirements, db.reviews, db.handovers, db.releaseGates, async () => {
       const doc = await db.docs.get(docId)
       if (!doc) { result = { status: 'missing' }; return }
       if (doc.ownerId !== userId && role !== ROLE.ADMIN) { result = { status: 'denied', title: doc.title }; return }
@@ -140,6 +140,12 @@ export const useRetirementStore = defineStore('retirement', () => {
 
       const dup = await db.retirements.filter((r) => isRetirementOpen(r) && r.docId === docId).first()
       if (dup) { result = { status: 'in-retirement', title: doc.title, retirement: dup }; return }
+
+      // 发布门禁流转中：候选版本尚未放行，先撤回/走完门禁再退役
+      const openGateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
+      if (openGateRec && (openGateRec.status === 'pending_confirm' || openGateRec.status === 'pending_approval')) {
+        result = { status: 'in-gate', title: doc.title }; return
+      }
 
       // 文档间替代冲突：本文档正作为他人在途/生效退役的替代文档，退役它会让替代链断裂或成环
       const usedActive = await db.retirements
@@ -235,6 +241,9 @@ export const useRetirementStore = defineStore('retirement', () => {
     const activeRepCache = new Map()
     const reviewCache = new Map()
     const handoverCache = new Map()
+    const allGates = await db.releaseGates.toArray()
+    const openGateOfDocTx = (id) =>
+      allGates.find((g) => g.docId === id && (g.status === 'pending_confirm' || g.status === 'pending_approval')) || null
     const openRetirementOfDocTx = (id) => {
       if (!openCache.has(id)) openCache.set(id, allRetirements.find((r) => isRetirementOpen(r) && r.docId === id) || null)
       return openCache.get(id)
@@ -273,6 +282,8 @@ export const useRetirementStore = defineStore('retirement', () => {
     for (const row of checked.rows) {
       const doc = docs[row.docId]
       if (doc && doc.ownerId !== userId && role !== ROLE.ADMIN) row.error = 'denied'
+      // 发布门禁流转中：先撤回/走完门禁再退役
+      if (!row.error && doc && openGateOfDocTx(doc.id)) row.error = 'in-gate'
     }
     return { rows: checked.rows, docs }
   }
@@ -300,7 +311,7 @@ export const useRetirementStore = defineStore('retirement', () => {
     // 预检事务：以库中最新数据逐行判定
     const { rows: checkedRows } = await db.transaction(
       'r',
-      db.docs, db.retirements, db.reviews, db.handovers,
+      db.docs, db.retirements, db.reviews, db.handovers, db.releaseGates,
       async () => checkBatchRowsInTx(cleanRows, userId, role)
     )
     const invalid = checkedRows.filter((r) => r.error)
@@ -352,7 +363,7 @@ export const useRetirementStore = defineStore('retirement', () => {
   async function runBatchSubmitItem(item, ctx) {
     const nowIso = new Date().toISOString()
     let result = { status: 'error' }
-    await db.transaction('rw', db.docs, db.retirements, db.retirementBatches, db.reviews, db.handovers, async () => {
+    await db.transaction('rw', db.docs, db.retirements, db.retirementBatches, db.reviews, db.handovers, db.releaseGates, async () => {
       const { docId, replacementDocId, reason, batchIndex } = item.payload
       // 幂等：同一批次已为该文档建立在途/任意退役单（重放、重复提交）
       const existed = await db.retirements
@@ -387,6 +398,10 @@ export const useRetirementStore = defineStore('retirement', () => {
       const pendingReview = await db.reviews
         .where('docId').equals(docId).filter((rv) => rv.status === 'pending').first()
       if (pendingReview) { result = { status: 'in-review', title: doc.title }; return }
+      const openGateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
+      if (openGateRec && (openGateRec.status === 'pending_confirm' || openGateRec.status === 'pending_approval')) {
+        result = { status: 'in-gate', title: doc.title }; return
+      }
       const handover = await db.handovers
         .filter((h) => (h.items || []).some((i) => i.docId === docId && isItemOpen(i))).first()
       if (handover) { result = { status: 'in-handover', title: doc.title }; return }
@@ -475,7 +490,7 @@ export const useRetirementStore = defineStore('retirement', () => {
 
     await db.transaction(
       'rw',
-      db.retirements, db.retirementBatches, db.docs, db.shares, db.gapTickets, db.reviews, db.handovers,
+      db.retirements, db.retirementBatches, db.docs, db.shares, db.gapTickets, db.reviews, db.handovers, db.releaseGates,
       async () => {
         const r = await db.retirements.get(id)
         if (!r) { result = { status: 'missing' }; return }
@@ -515,6 +530,11 @@ export const useRetirementStore = defineStore('retirement', () => {
           .where('docId').equals(doc.id)
           .filter((rv) => rv.status === 'pending').first()
         if (pendingReview) { result = { status: 'in-review', title: doc.title }; return }
+        // 审批期间旧文档进入发布门禁：候选版本未放行，先处理门禁再退役
+        const openGateRec = doc.release?.activeGateId ? await db.releaseGates.get(doc.release.activeGateId) : null
+        if (openGateRec && (openGateRec.status === 'pending_confirm' || openGateRec.status === 'pending_approval')) {
+          result = { status: 'in-gate', title: doc.title }; return
+        }
         const handover = await db.handovers.filter((h) => (h.items || []).some((i) => i.docId === doc.id && isItemOpen(i))).first()
         if (handover) { result = { status: 'in-handover', title: doc.title }; return }
 
@@ -932,7 +952,7 @@ async function actorOf(ctx) {
 registerBatchHandler({
   module: 'retirement',
   action: 'batch-submit',
-  setupTables: () => [db.users, db.docs, db.retirements, db.retirementBatches, db.reviews, db.handovers],
+  setupTables: () => [db.users, db.docs, db.retirements, db.retirementBatches, db.reviews, db.handovers, db.releaseGates],
   setup: setupRetirementBatch,
   afterFinish: traceRetirementBatchFinish,
   runItem: async (item, ctx) => {
@@ -946,7 +966,7 @@ registerBatchHandler({
   module: 'retirement',
   action: 'batch-approve',
   setupTables: () => [
-    db.users, db.docs, db.retirements, db.retirementBatches, db.shares, db.gapTickets, db.reviews, db.handovers
+    db.users, db.docs, db.retirements, db.retirementBatches, db.shares, db.gapTickets, db.reviews, db.handovers, db.releaseGates
   ],
   afterFinish: traceRetirementBatchFinish,
   runItem: async (item, ctx) => {
